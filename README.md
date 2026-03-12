@@ -105,7 +105,7 @@ The discovery script includes a blocklist to filter out:
 
 ## CSV Output
 
-### Discovery Results (`discovered/discovered.csv`)
+### Discovery Results
 
 | Field | Description |
 |-------|-------------|
@@ -120,7 +120,7 @@ The discovery script includes a blocklist to filter out:
 | discovered_at | Discovery timestamp |
 | label | Content label (neutral) |
 
-### Scraping Results (`dataset/results.csv`)
+### Scraping Results
 
 | Field | Description |
 |-------|-------------|
