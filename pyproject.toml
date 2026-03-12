@@ -1,0 +1,11 @@
+[project]
+name = "audio-engine"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "twikit>=2.3.3",
+    "yt-dlp>=2026.3.3",
+]
