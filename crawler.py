@@ -335,6 +335,19 @@ def build_keyword_from_tags(tags: list[str]) -> str:
     return f"tag:{','.join(normalized_tags)}"[:120]
 
 
+def build_seed_keyword(tag_path: str, fallback_label: str) -> str:
+    match = re.search(r"/tag/([^/?#]+)", tag_path)
+    if match:
+        return build_keyword_from_tags([match.group(1).replace("-", " ")])
+    if "category=" in tag_path:
+        category = tag_path.split("category=", 1)[1].split("&", 1)[0]
+        return f"category:{category}"[:120]
+    if tag_path in {"/", ""}:
+        return f"seed:{fallback_label}"[:120]
+    slug = tag_path.strip("/").replace("/", ":").replace("-", " ")
+    return f"seed:{slug or fallback_label}"[:120]
+
+
 def normalize_video_url(url: str) -> str:
     """Normalize supported social video URLs into stable canonical forms."""
     url = url.strip()
@@ -395,8 +408,17 @@ def normalize_video_url(url: str) -> str:
     return url.split("?")[0]
 
 
-def extract_video_urls_from_html(html: str, base_url: str) -> list[str]:
-    """Extract all video URLs from HTML content (embeds and hyperlinks)."""
+def _extract_anchor_hrefs(html: str, base_url: str) -> list[str]:
+    hrefs = []
+    for m in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\']', html):
+        href = m.group(1)
+        if not href.startswith("http"):
+            href = urljoin(base_url, href)
+        hrefs.append(href)
+    return hrefs
+
+
+def _extract_video_urls_generic(html: str, base_url: str) -> set[str]:
     urls = set()
 
     # YouTube embeds
@@ -428,12 +450,7 @@ def extract_video_urls_from_html(html: str, base_url: str) -> list[str]:
     for m in re.finditer(r"(?:twitter|x)\.com/\w+/status/(\d+)", html):
         urls.add(f"https://x.com/i/web/status/{m.group(1)}")
 
-    # Hyperlinks to video platforms
-    for m in re.finditer(r'<a[^>]+href=["\']([^"\']+)["\']', html):
-        href = m.group(1)
-        if not href.startswith("http"):
-            href = urljoin(base_url, href)
-
+    for href in _extract_anchor_hrefs(html, base_url):
         if re.search(
             r"(?:youtube\.com/(?:watch\?v=|embed/)|m\.youtube\.com/watch\?v=|youtu\.be/|"
             r"tiktok\.com/.+/video/|(?:vm|vt)\.tiktok\.com/|"
@@ -443,9 +460,46 @@ def extract_video_urls_from_html(html: str, base_url: str) -> list[str]:
             href,
         ):
             urls.add(normalize_video_url(href))
-            continue
 
-    return list(urls)
+    return urls
+
+
+def _extract_turnbackhoax_source_urls(html: str, base_url: str) -> set[str]:
+    """Prefer claimed/source-post links over evidence/reference links."""
+    blocks = []
+
+    for pattern in (
+        r"Narasi(.*?)(?:Penjelasan|Kesimpulan|Hasil Periksa fakta)",
+        r"Salah Sumber:(.*?)(?:Referensi|Artikel terbaru|$)",
+    ):
+        match = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            blocks.append(match.group(1))
+
+    preferred_urls = set()
+    for block in blocks:
+        for href in _extract_anchor_hrefs(block, base_url):
+            if re.search(
+                r"(?:instagram\.com/(?:reel|p)/|"
+                r"tiktok\.com/.+/video/|(?:vm|vt)\.tiktok\.com/|"
+                r"(?:facebook\.com|fb\.com|fb\.watch).*(?:/videos/|watch\?v=|/reel/)|"
+                r"(?:twitter|x)\.com/\w+/status/|"
+                r"youtube\.com/(?:watch\?v=|embed/)|youtu\.be/)",
+                href,
+            ):
+                preferred_urls.add(normalize_video_url(href))
+
+    return preferred_urls
+
+
+def extract_video_urls_from_html(html: str, base_url: str) -> list[str]:
+    """Extract all video URLs from HTML content (embeds and hyperlinks)."""
+    if "turnbackhoax.id/articles/" in base_url:
+        preferred_urls = _extract_turnbackhoax_source_urls(html, base_url)
+        if preferred_urls:
+            return list(preferred_urls)
+
+    return list(_extract_video_urls_generic(html, base_url))
 
 
 def classify_by_tags(tags: list[str]) -> str:
@@ -506,14 +560,14 @@ async def fetch(client: httpx.AsyncClient, url: str, retries: int = 4) -> str | 
 
 async def fetch_articles(
     client: httpx.AsyncClient,
-    article_jobs: list[tuple[str, str]],
+    article_jobs: list[tuple[str, str, str]],
     extract_tags_fn=None,
     concurrency: int = 8,
 ) -> list[dict]:
     sem = asyncio.Semaphore(concurrency)
     results = []
 
-    async def process_one(article_url: str, fallback_label: str):
+    async def process_one(article_url: str, fallback_label: str, fallback_keyword: str):
         async with sem:
             html = await fetch(client, article_url)
             if not html:
@@ -527,11 +581,15 @@ async def fetch_articles(
                         "url": vu,
                         "tags": tags,
                         "label": label,
+                        "fallback_keyword": fallback_keyword,
                     }
                 )
 
     await asyncio.gather(
-        *[process_one(article_url, fallback_label) for article_url, fallback_label in article_jobs]
+        *[
+            process_one(article_url, fallback_label, fallback_keyword)
+            for article_url, fallback_label, fallback_keyword in article_jobs
+        ]
     )
     return results
 
@@ -544,11 +602,12 @@ async def collect_tag_articles_paginated(
     base_tag_url: str,
     article_regex: str,
     default_label: str,
+    seed_keyword: str,
     pagination: str,
     skip_fn=None,
     max_articles: int | None = None,
     max_pages: int = MAX_PAGES_PER_TAG,
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str, str]]:
     """Collect article URLs from a tag page using the configured pagination style."""
     article_jobs = []
     seen_urls = set()
@@ -567,7 +626,7 @@ async def collect_tag_articles_paginated(
             if a_url not in seen_urls:
                 if skip_fn is None or not skip_fn(a_url):
                     seen_urls.add(a_url)
-                    article_jobs.append((a_url, default_label))
+                    article_jobs.append((a_url, default_label, seed_keyword))
                     found_on_page += 1
                     if max_articles is not None and len(article_jobs) >= max_articles:
                         break
@@ -618,6 +677,7 @@ async def scrape_site_from_config(
         # Over-sample a bit because some articles have no video embeds and some duplicates collapse.
         max_articles = max(remaining * 3, 10)
         base_url = f"{base_domain}{tag_path}"
+        seed_keyword = build_seed_keyword(tag_path, tag_label)
 
         if pagination in (PAGINATION_QUERY, PAGINATION_BOTH):
             log.info(
@@ -628,6 +688,7 @@ async def scrape_site_from_config(
                 base_url,
                 article_regex,
                 tag_label,
+                seed_keyword,
                 PAGINATION_QUERY,
                 skip_fn=skip_fn,
                 max_articles=max_articles,
@@ -643,6 +704,7 @@ async def scrape_site_from_config(
                 base_url,
                 article_regex,
                 tag_label,
+                seed_keyword,
                 PAGINATION_PATH,
                 skip_fn=skip_fn,
                 max_articles=max_articles,
@@ -653,10 +715,10 @@ async def scrape_site_from_config(
     # Deduplicate
     seen = set()
     unique = []
-    for url, label in article_jobs:
+    for url, label, keyword in article_jobs:
         if url not in seen:
             seen.add(url)
-            unique.append((url, label))
+            unique.append((url, label, keyword))
 
     log.info(
         f"  [{site_name}] fetching {len(unique)} articles (concurrency={concurrency})"
@@ -792,7 +854,8 @@ def save_results(
                 "source_article": r.get("source_article", ""),
                 "url": url,
                 "platform": detect_content_platform(url),
-                "keyword": build_keyword_from_tags(r.get("tags", [])),
+                "keyword": build_keyword_from_tags(r.get("tags", []))
+                or r.get("fallback_keyword", ""),
                 "discovered_at": datetime.now().isoformat(timespec="seconds"),
                 "weak_label": label,
             }
