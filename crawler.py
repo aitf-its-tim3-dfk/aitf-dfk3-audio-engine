@@ -38,14 +38,27 @@ import argparse
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import httpx
 
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
+def setup_logging(log_file: str | None = None, level: int = logging.INFO):
+    root = logging.getLogger()
+    root.setLevel(level)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    root.handlers.clear()
+    stdout_handler = logging.StreamHandler(sys.stdout)
+    stdout_handler.setFormatter(fmt)
+    root.addHandler(stdout_handler)
+    if log_file:
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    return root
+
+
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -74,13 +87,37 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
 ]
 
-SITE_CONCURRENCY = {
-    "turnbackhoax": 3,
-    "kompas": 4,
-    "detik": 4,
-    "liputan6": 3,
-    "cnnindonesia": 4,
-}
+
+NEUTRAL_TOPICS = [
+    "musik indonesia",
+    "resep rumahan",
+    "tips belajar",
+    "olahraga pagi",
+    "review gadget",
+    "travel jakarta",
+    "kuliner bandung",
+    "film terbaru",
+    "komedi lucu",
+    "gaming mobile",
+    "parenting anak",
+    "kesehatan mental",
+    "dekorasi rumah",
+    "fashion hijab",
+    "otomotif motor",
+    "hewan lucu",
+    "wisata jogja",
+    "fotografi pemula",
+    "produktif kerja",
+    "berkebun rumah",
+]
+
+NEUTRAL_PLATFORM_SEARCHES = [
+    ("youtube", "https://www.youtube.com/results?search_query={query}"),
+    ("tiktok", "https://www.tiktok.com/search?q={query}"),
+    ("instagram", "https://www.instagram.com/explore/search/keyword/?q={query}"),
+    ("twitter", "https://x.com/search?q={query}&src=typed_query&f=live"),
+    ("facebook", "https://www.facebook.com/search/videos?q={query}"),
+]
 
 TAG_TO_LABEL = {
     "disinformasi": [
@@ -127,32 +164,17 @@ TAG_TO_LABEL = {
         "permusuhan",
         "kebencian",
     ],
-    "neutral": [
-        "gaya hidup",
-        "lifestyle",
-        "hiburan",
-        "entertainment",
-        "olahraga",
-        "sport",
-        "teknologi",
-        "kesehatan",
-        "pendidikan",
-        "wisata",
-        "travel",
-        "kuliner",
-        "musik",
-        "film",
-        "otomotif",
-        "bisnis",
-        "ekonomi",
-        "politik umum",
-        "berita umum",
-        "human interest",
-    ],
 }
 
-CSV_FIELDS = ["id", "source_article", "url", "platform", "keyword",
-              "discovered_at", "weak_label"]
+CSV_FIELDS = [
+    "id",
+    "source_article",
+    "url",
+    "platform",
+    "keyword",
+    "discovered_at",
+    "weak_label",
+]
 
 PLATFORM_MAP = {
     "instagram.com": "instagram",
@@ -348,6 +370,10 @@ def build_seed_keyword(tag_path: str, fallback_label: str) -> str:
     return f"seed:{slug or fallback_label}"[:120]
 
 
+def build_search_keyword(topic: str, platform: str) -> str:
+    return f"search:{platform}:{topic}"[:120]
+
+
 def normalize_video_url(url: str) -> str:
     """Normalize supported social video URLs into stable canonical forms."""
     url = url.strip()
@@ -437,7 +463,7 @@ def _extract_video_urls_generic(html: str, base_url: str) -> set[str]:
     # Facebook video embeds
     for m in re.finditer(r'facebook\.com/[^"\'>\s]*(?:/videos/|watch\?v=)(\d+)', html):
         urls.add(f"https://www.facebook.com/watch?v={m.group(1)}")
-    for m in re.finditer(r'facebook\.com/reel/(\d+)', html):
+    for m in re.finditer(r"facebook\.com/reel/(\d+)", html):
         urls.add(f"https://www.facebook.com/watch?v={m.group(1)}")
     for m in re.finditer(r'fb\.watch/[^"\'>\s/]+/?', html):
         urls.add(normalize_video_url(m.group(0)))
@@ -529,10 +555,12 @@ async def fetch(client: httpx.AsyncClient, url: str, retries: int = 4) -> str | 
     for attempt in range(retries):
         headers = {**HEADERS, "User-Agent": random.choice(USER_AGENTS)}
         try:
-            resp = await client.get(url, headers=headers, follow_redirects=True, timeout=15)
+            resp = await client.get(
+                url, headers=headers, follow_redirects=True, timeout=15
+            )
 
             if resp.status_code == 429:
-                wait = (2 ** attempt) * random.uniform(5, 10)  # exponential backoff
+                wait = (2**attempt) * random.uniform(5, 10)  # exponential backoff
                 log.warning(f"Rate limited on {url}. Waiting {wait:.1f}s...")
                 await asyncio.sleep(wait)
                 continue
@@ -546,8 +574,10 @@ async def fetch(client: httpx.AsyncClient, url: str, retries: int = 4) -> str | 
                 return resp.text
 
         except (httpx.TimeoutException, httpx.ConnectError) as e:
-            wait = (2 ** attempt) * random.uniform(2, 5)
-            log.debug(f"Attempt {attempt+1} failed [{url}]: {e}. Retrying in {wait:.1f}s")
+            wait = (2**attempt) * random.uniform(2, 5)
+            log.debug(
+                f"Attempt {attempt + 1} failed [{url}]: {e}. Retrying in {wait:.1f}s"
+            )
             await asyncio.sleep(wait)
 
         except Exception as e:
@@ -589,6 +619,39 @@ async def fetch_articles(
         *[
             process_one(article_url, fallback_label, fallback_keyword)
             for article_url, fallback_label, fallback_keyword in article_jobs
+        ]
+    )
+    return results
+
+
+async def fetch_search_results(
+    client: httpx.AsyncClient,
+    search_jobs: list[tuple[str, str, str]],
+    concurrency: int = 8,
+) -> list[dict]:
+    sem = asyncio.Semaphore(concurrency)
+    results = []
+
+    async def process_one(search_url: str, fallback_label: str, fallback_keyword: str):
+        async with sem:
+            html = await fetch(client, search_url)
+            if not html:
+                return
+            for vu in extract_video_urls_from_html(html, search_url):
+                results.append(
+                    {
+                        "source_article": search_url,
+                        "url": vu,
+                        "tags": [],
+                        "label": fallback_label,
+                        "fallback_keyword": fallback_keyword,
+                    }
+                )
+
+    await asyncio.gather(
+        *[
+            process_one(search_url, fallback_label, fallback_keyword)
+            for search_url, fallback_label, fallback_keyword in search_jobs
         ]
     )
     return results
@@ -664,17 +727,17 @@ async def scrape_site_from_config(
     skip_fn = config.get("skip_fn")
     tag_pages = config["tag_pages"]
 
-    needed_labels = [label for label, remaining in remaining_per_label.items() if remaining > 0]
+    needed_labels = [
+        label for label, remaining in remaining_per_label.items() if remaining > 0
+    ]
     if not needed_labels:
         return []
 
-    # Run both pagination styles and merge results
     article_jobs = []
     for tag_path, tag_label in tag_pages:
         if tag_label not in needed_labels:
             continue
         remaining = remaining_per_label.get(tag_label, 0)
-        # Over-sample a bit because some articles have no video embeds and some duplicates collapse.
         max_articles = max(remaining * 3, 10)
         base_url = f"{base_domain}{tag_path}"
         seed_keyword = build_seed_keyword(tag_path, tag_label)
@@ -697,8 +760,7 @@ async def scrape_site_from_config(
             article_jobs.extend(jobs)
 
         if pagination in (PAGINATION_PATH, PAGINATION_BOTH):
-            log.info(
-                f"  [{site_name}] collecting from {base_url} (pagination: /N)")
+            log.info(f"  [{site_name}] collecting from {base_url} (pagination: /N)")
             jobs = await collect_tag_articles_paginated(
                 client,
                 base_url,
@@ -712,7 +774,6 @@ async def scrape_site_from_config(
             )
             article_jobs.extend(jobs)
 
-    # Deduplicate
     seen = set()
     unique = []
     for url, label, keyword in article_jobs:
@@ -723,14 +784,52 @@ async def scrape_site_from_config(
     log.info(
         f"  [{site_name}] fetching {len(unique)} articles (concurrency={concurrency})"
     )
-    safe_concurrency = min(concurrency, SITE_CONCURRENCY.get(site_name, 4))
     results = await fetch_articles(
         client,
         unique,
         extract_tags_fn,
-        safe_concurrency,
+        concurrency,
     )
     return results
+
+
+async def scrape_neutral_platform_searches(
+    client: httpx.AsyncClient,
+    remaining_per_label: dict[str, int],
+    concurrency: int = DEFAULT_CONCURRENCY,
+) -> list[dict]:
+    remaining = remaining_per_label.get("neutral", 0)
+    if remaining <= 0:
+        return []
+
+    topics = list(NEUTRAL_TOPICS)
+    random.shuffle(topics)
+    search_jobs = []
+    seen_search_urls = set()
+
+    topics_needed = max(remaining * 2, 12)
+    for topic in topics[:topics_needed]:
+        encoded = quote_plus(topic)
+        for platform, template in NEUTRAL_PLATFORM_SEARCHES:
+            search_url = template.format(query=encoded)
+            if search_url in seen_search_urls:
+                continue
+            seen_search_urls.add(search_url)
+            search_jobs.append(
+                (search_url, "neutral", build_search_keyword(topic, platform))
+            )
+
+    if not search_jobs:
+        return []
+
+    log.info(
+        f"  [neutral-platforms] fetching {len(search_jobs)} direct platform search pages"
+    )
+    return await fetch_search_results(
+        client,
+        search_jobs,
+        concurrency=min(concurrency, 6),
+    )
 
 
 # ── Site Scrapers (now config-driven) ─────────────────────────────────────────
@@ -819,11 +918,10 @@ def append_rows(csv_path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def remaining_label_targets(per_label: dict[str, int], labels: list[str], target: int) -> dict[str, int]:
-    return {
-        label: max(target - per_label.get(label, 0), 0)
-        for label in labels
-    }
+def remaining_label_targets(
+    per_label: dict[str, int], labels: list[str], target: int
+) -> dict[str, int]:
+    return {label: max(target - per_label.get(label, 0), 0) for label in labels}
 
 
 def save_results(
@@ -909,10 +1007,19 @@ async def run(args):
             site_results = await scraper_fn(
                 client, remaining_per_label, args.concurrency, args.max_pages
             )
-            site_results = [r for r in site_results if r.get(
-                "label") in args.labels]
-            log.info(
-                f"  Found {len(site_results)} video URLs from {site_name}")
+            if remaining_per_label.get("neutral", 0) > 0:
+                neutral_results = await scrape_neutral_platform_searches(
+                    client,
+                    remaining_per_label,
+                    args.concurrency,
+                )
+                if neutral_results:
+                    log.info(
+                        f"  Added {len(neutral_results)} candidate URLs from direct platform searches"
+                    )
+                    site_results.extend(neutral_results)
+            site_results = [r for r in site_results if r.get("label") in args.labels]
+            log.info(f"  Found {len(site_results)} video URLs from {site_name}")
 
             per_label = save_results(
                 site_results,
@@ -957,8 +1064,7 @@ def main():
     p.add_argument(
         "--sites",
         nargs="+",
-        default=["turnbackhoax", "kompas",
-                 "detik", "liputan6", "cnnindonesia"],
+        default=["turnbackhoax", "kompas", "detik", "liputan6", "cnnindonesia"],
         choices=list(SITE_SCRAPERS.keys()),
         help="News sites to scrape",
     )
@@ -987,7 +1093,14 @@ def main():
         default=MAX_PAGES_PER_TAG,
         help=f"Max pagination pages per tag (default: {MAX_PAGES_PER_TAG})",
     )
+    p.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Optional file to write logs to (in addition to stdout)",
+    )
     args = p.parse_args()
+    setup_logging(args.log_file)
 
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
