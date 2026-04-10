@@ -1,138 +1,177 @@
-# Audio Engine
+﻿# Audio Engine
 
-A Python toolkit for discovering and scraping audio from Indonesian social media videos. Designed to collect neutral, non-political content for research and dataset building purposes.
+Python tools for building an Indonesian social-video audio dataset: collect URLs, download audio, optionally augment it, transcribe speech, and synthesize TTS audio.
 
-## Features
+## Scripts
 
-- **Discovery**: Automatically finds neutral Indonesian video URLs from multiple platforms
-- **Scraping**: Downloads audio from social media URLs in various formats
-- **Platform Support**: TikTok, Instagram, Facebook, YouTube, Twitter/X
-- **Filtering**: Built-in blocklist to filter out political and sensitive content
+- `crawler.py`: collects candidate social-video URLs and weak labels into `data.csv`
+- `scraper.py`: downloads audio with `yt-dlp` and writes a results CSV
+- `augment.py`: creates augmented audio variants, including optional external RVC runs
+- `stt.py`: speech-to-text for audio files or folders using the OpenAI transcription API
+- `tts.py`: text-to-speech with OmniVoice
+- `scripter.py`: generates spoken-style text prompts/scripts for TTS workflows
 
-## Installation
+## Setup
+
+### 1. Export cookies first
+
+For Instagram, TikTok, X, or Facebook, log in in your browser and export Netscape-format cookie files.
+
+Put them here:
+
+```text
+cookies/instagram_cookies.txt
+cookies/tiktok_cookies.txt
+cookies/twitter_cookies.txt
+cookies/facebook_cookies.txt
+```
+
+Notes:
+- `scraper.py` can auto-pick these files by platform
+- cookie files are usually more reliable than `--cookies-from-browser`
+- keep them private
+
+### 2. Install Python dependencies
 
 ```bash
-# Clone the repository
-cd aitf-dfk3-audio-engine
-
-# Install dependencies with uv
 uv sync
+```
 
-# Or with pip
+Or:
+
+```bash
 pip install -e .
 ```
 
-## Dependencies
+Python `3.11+` is required.
 
-- Python 3.11+
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) - Video/audio downloading
-- [twikit](https://github.com/disisdevel/twikit) - Twitter/X API client
-- [BeautifulSoup4](https://www.crummy.com/software/BeautifulSoup/) - HTML parsing
+### 3. Optional: set your OpenAI API key
 
-## Usage
+Needed for `stt.py`.
 
-### 1. Discover Videos (optional)
+PowerShell:
 
-Discover neutral Indonesian video URLs from social media:
+```powershell
+$env:OPENAI_API_KEY="your-key-here"
+```
+
+## Recommended Workflow
+
+### 1. Test one URL first
+
+Before running a big batch, test one authenticated URL with low concurrency:
 
 ```bash
-# Discover 700 URLs from all platforms (default)
-python discovery.py --target 700 --output ./discovered
-
-# Discover from specific platforms
-python discovery.py --target 700 --platforms tiktok youtube --output ./discovered
-
-# Use browser cookies for better access
-python discovery.py --target 700 --cookies-from-browser chrome --output ./discovered
-
-# For Twitter/X, generate cookies with twitter_login.py first
-python discovery.py --target 700 --twitter-cookies twitter_cookies.json --output ./discovered
+python scraper.py --urls "https://www.instagram.com/reel/..." --workers 1 --delay 3
 ```
 
-### 2. Scrape Audio
+### 2. Build `data.csv`
 
-Download audio from discovered URLs:
+Use `crawler.py` to gather candidate URLs and weak labels.
 
 ```bash
-# Using URLs from a file
-python scraper.py discovered/urls.txt --output ./dataset
-
-# Using URLs directly
-python scraper.py --urls "https://instagram.com/reel/..." "https://tiktok.com/v/..." --output ./dataset
-
-# Specify audio format
-python scraper.py discovered/urls.txt --output ./dataset --format mp3
-
-# Use browser cookies
-python scraper.py discovered/urls.txt --output ./dataset --cookies-from-browser chrome
+python crawler.py --target 100
+python crawler.py --target 200 --labels neutral disinformasi
+python crawler.py --target 150 --sites kompas detik cnnindonesia
 ```
 
-## Project Structure
+Notes:
+- output defaults to `data.csv`
+- labels are `ujaran kebencian`, `fitnah`, `disinformasi`, and `neutral`
+- neutral collection is supplemented with direct platform search pages
 
+### 3. Download audio
+
+Use `scraper.py` on the generated CSV or on direct URLs.
+
+```bash
+python scraper.py data.csv --output ./dataset
+python scraper.py data.csv --output ./dataset --format mp3
+python scraper.py data.csv --output ./dataset --workers 1 --delay 3
 ```
-audio-engine/
-├── discovery.py      # URL discovery script
-├── scraper.py        # Audio scraping script
-└── README.md
+
+If you want to force a single cookie file:
+
+```bash
+python scraper.py data.csv --cookies cookies/instagram_cookies.txt
 ```
 
-## Configuration
+Audio files are stored under `<output>/<audio-dir>`, which defaults to `dataset/raw`.
 
-### Discovery Options
+### 4. Augment audio
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--target` | 700 | Number of URLs to collect |
-| `--platforms` | tiktok, instagram, facebook, youtube | Platforms to search |
-| `--per-keyword` | 20 | Results per keyword per platform |
-| `--delay` | 2.0 | Seconds between requests |
+`augment.py` reads a scraped dataset and writes augmented variants plus an `augmented_results.csv`.
 
-### Scraper Options
+```bash
+python augment.py ./dataset --output ./dataset_augmented
+python augment.py ./dataset --output ./dataset_augmented --num-versions 3
+python augment.py ./dataset --output ./dataset_augmented --augmentations pitch_up speed_down noise_white
+```
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--output` | dataset | Output directory |
-| `--format` | wav | Audio format (wav, mp3, m4a, opus, flac) |
-| `--audio-dir` | audios | Subdirectory for audio files |
-| `--delay` | 1.0 | Seconds between downloads |
+RVC is available as an external augmentation backend:
 
-## Blocklist
+```bash
+python augment.py ./dataset --output ./dataset_augmented --augmentations rvc \
+  --rvc-command-template "python infer_cli.py --input_path \"{input}\" --output_path \"{output}\" --model_path \"{model}\" --index_path \"{index}\" --pitch {pitch}" \
+  --rvc-model "D:\path\to\voice.pth" \
+  --rvc-index "D:\path\to\voice.index"
+```
 
-The discovery script includes a blocklist to filter out:
-- Political content (pilkada, pilpres, capres, etc.)
-- Sensitive topics (korupsi, teroris, etc.)
-- Offensive language
+### 5. Transcribe audio
 
-## CSV Output
+`stt.py` converts speech to text and can handle either one file or a directory.
 
-### Discovery Results
+```bash
+python stt.py .\dataset\raw\sample.wav
+python stt.py .\dataset\raw --output .\transcripts --recursive --language id
+python stt.py .\dataset\raw --output .\transcripts --recursive --json
+```
 
-| Field | Description |
-|-------|-------------|
-| id | Unique identifier |
-| url | Video URL |
-| platform | Source platform |
-| keyword | Search keyword |
-| title | Video title |
-| author | Content creator |
-| duration | Video duration (seconds) |
-| caption | Video description |
-| discovered_at | Discovery timestamp |
-| label | Content label (neutral) |
+### 6. Generate TTS audio
 
-### Scraping Results
+`tts.py` is the OmniVoice text-to-speech entrypoint.
 
-| Field | Description |
-|-------|-------------|
-| url | Source URL |
-| platform | Source platform |
-| title | Video title |
-| uploader | Content creator |
-| duration_sec | Audio duration |
-| filename | Output file path |
-| status | Download status (ok/failed) |
-| error | Error message if failed |
-| scraped_at | Scraping timestamp |
+```bash
+python tts.py --text "Halo dunia" --output halo.wav
+python tts.py --file script.txt --output .\tts_output
+```
+
+## Outputs
+
+### `crawler.py`
+
+Main file: `data.csv`
+
+Fields include:
+- `id`
+- `source_article`
+- `url`
+- `platform`
+- `keyword`
+- `discovered_at`
+- `weak_label`
+
+### `scraper.py`
+
+CSV fields include:
+- `url`
+- `platform`
+- `title`
+- `uploader`
+- `duration_sec`
+- `filename`
+- `status`
+- `error`
+- `scraped_at`
+- `resolved_url`
+- `weak_label`
+- `source_article`
+- `keyword`
+
+## Notes
+
+- `scraper.py` uses a process pool so interrupted `yt-dlp` jobs can be stopped more reliably than with threads
+- `tts.py` requires OmniVoice and its local inference dependencies, which are not part of the base `pyproject.toml`
 
 ## License
 
