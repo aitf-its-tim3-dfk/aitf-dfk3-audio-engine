@@ -1,24 +1,81 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-Speech-to-text transcription CLI.
+Speech-to-text transcription CLI using Hugging Face models.
 
 Usage:
     python stt.py audio.wav
     python stt.py audio.wav --output transcript.txt
-    python stt.py ./dataset/raw --output ./transcripts --language id
-    python stt.py audio.wav --json
+    python stt.py ./dataset/raw --output ./transcripts
+    python stt.py audio.wav --model cahya/whisper-small-id
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
-from openai import OpenAI
+import torch
+from transformers import pipeline, AutoModelForSpeechSeq2Seq, AutoProcessor
 
 
-DEFAULT_MODEL = "gpt-4o-mini-transcribe"
-SUPPORTED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac", ".opus", ".ogg", ".webm", ".mp4", ".mpeg", ".mpga"}
+DEFAULT_MODEL = "cahya/whisper-medium-id"
+SUPPORTED_EXTENSIONS = {
+    ".wav",
+    ".mp3",
+    ".m4a",
+    ".flac",
+    ".opus",
+    ".ogg",
+    ".webm",
+    ".mp4",
+    ".mpeg",
+    ".mpga",
+}
+
+CACHE_DIR = Path("models")
+
+
+def get_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def load_model(model_name: str, device: str):
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        model_name,
+        cache_dir=CACHE_DIR,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    )
+    processor = AutoProcessor.from_pretrained(model_name, cache_dir=CACHE_DIR)
+    return model, processor
+
+
+transcriber = None
+current_model = None
+current_device = None
+
+
+def get_transcriber(model_name: str):
+    global transcriber, current_model, current_device
+    device = get_device()
+
+    if current_model != model_name or current_device != device:
+        print(f"Loading model {model_name} on {device}...")
+        model, processor = load_model(model_name, device)
+        transcriber = pipeline(
+            "automatic-speech-recognition",
+            model=model,
+            tokenizer=processor.tokenizer,
+            feature_extractor=processor.feature_extractor,
+            max_new_tokens=processor.model.config.max_new_tokens,
+            chunk_length_s=30,
+            batch_size=16,
+            device=device,
+        )
+        current_model = model_name
+        current_device = device
+
+    return transcriber
 
 
 def iter_audio_files(path: Path, recursive: bool) -> list[Path]:
@@ -33,7 +90,9 @@ def iter_audio_files(path: Path, recursive: bool) -> list[Path]:
     )
 
 
-def resolve_output_path(input_path: Path, source_root: Path, output: Path, multiple: bool) -> Path:
+def resolve_output_path(
+    input_path: Path, source_root: Path, output: Path, multiple: bool
+) -> Path:
     if not multiple:
         if output.suffix:
             return output
@@ -44,25 +103,12 @@ def resolve_output_path(input_path: Path, source_root: Path, output: Path, multi
     return output / relative.with_suffix(".txt")
 
 
-def transcribe_file(client: OpenAI, audio_path: Path, model: str, language: str | None, prompt: str | None, response_format: str):
-    with audio_path.open("rb") as audio_file:
-        return client.audio.transcriptions.create(
-            model=model,
-            file=audio_file,
-            language=language or None,
-            prompt=prompt or None,
-            response_format=response_format,
-        )
-
-
-def save_text_output(text: str, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(text, encoding="utf-8")
-
-
-def save_json_output(payload: dict, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+def transcribe_file(transcriber, audio_path: Path):
+    result = transcriber(
+        str(audio_path),
+        return_timestamps=False,
+    )
+    return result["text"].strip()
 
 
 def run(args) -> None:
@@ -77,38 +123,28 @@ def run(args) -> None:
         sys.exit(1)
 
     multiple = len(audio_files) > 1 or input_path.is_dir()
-    output_path = Path(args.output) if args.output else (Path("transcripts") if multiple else input_path.with_suffix(".txt"))
+    output_path = (
+        Path(args.output)
+        if args.output
+        else (Path("transcripts") if multiple else input_path.with_suffix(".txt"))
+    )
     if multiple and output_path.suffix:
-        print("Error: Directory input requires --output to be a directory, not a single file")
+        print(
+            "Error: Directory input requires --output to be a directory, not a single file"
+        )
         sys.exit(1)
 
-    client = OpenAI()
+    transcriber = get_transcriber(args.model)
     failures = 0
 
     for index, audio_path in enumerate(audio_files, 1):
         destination = resolve_output_path(audio_path, input_path, output_path, multiple)
         print(f"[{index}/{len(audio_files)}] Transcribing {audio_path}")
         try:
-            result = transcribe_file(
-                client=client,
-                audio_path=audio_path,
-                model=args.model,
-                language=args.language,
-                prompt=args.prompt,
-                response_format="verbose_json" if args.json else "text",
-            )
-            if args.json:
-                payload = result.model_dump()
-                save_json_output(payload, destination.with_suffix(".json"))
-                text = (getattr(result, "text", None) or payload.get("text", "")).strip()
-                if text:
-                    save_text_output(text, destination)
-                    print(f"  Saved: {destination}")
-                else:
-                    print(f"  Saved JSON: {destination.with_suffix('.json')}")
-            else:
-                save_text_output(str(result).strip(), destination)
-                print(f"  Saved: {destination}")
+            text = transcribe_file(transcriber, audio_path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(text, encoding="utf-8")
+            print(f"  Saved: {destination}")
         except Exception as exc:
             failures += 1
             print(f"  Failed: {exc}")
@@ -121,11 +157,16 @@ def main():
     parser = argparse.ArgumentParser(description="Speech-to-text transcription")
     parser.add_argument("input", help="Audio file or directory of audio files")
     parser.add_argument("--output", "-o", help="Output text file or output directory")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Transcription model (default: {DEFAULT_MODEL})")
-    parser.add_argument("--language", default=None, help="Optional language hint, e.g. id or en")
-    parser.add_argument("--prompt", default=None, help="Optional prompt to guide transcription")
-    parser.add_argument("--recursive", action="store_true", help="Recursively scan directories for audio files")
-    parser.add_argument("--json", action="store_true", help="Also save verbose JSON output alongside text")
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Transcription model (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Recursively scan directories for audio files",
+    )
     run(parser.parse_args())
 
 
