@@ -37,10 +37,10 @@ from pathlib import Path
 
 DEFAULT_OUTPUT_DIR = "dataset"
 DEFAULT_AUDIO_DIR = "cleaned"
-DEFAULT_MIN_DURATION = 1.5
-DEFAULT_MAX_DURATION = 300.0
-DEFAULT_MIN_SIZE_MB = 0.05
-DEFAULT_MAX_SIZE_MB = 250.0
+DEFAULT_MIN_DURATION = 3
+DEFAULT_MAX_DURATION = None
+DEFAULT_MIN_SIZE_MB = None
+DEFAULT_MAX_SIZE_MB = None
 DEFAULT_MIN_RMS = 200.0
 DEFAULT_MAX_CLIP_RATIO = 0.02
 DEFAULT_MIN_VAD_RATIO = 0.15
@@ -54,7 +54,7 @@ DEFAULT_SILENCE_THRESHOLD_DB = -40
 DEFAULT_SILENCE_MIN_DURATION = 0.3
 
 SUPPORTED_EXTENSIONS = {".wav"}
-CSV_CANDIDATES = ("metadata.csv", "results.csv", "augmented_results.csv")
+CSV_CANDIDATES = ("metadata.csv",)
 
 VALID_LABELS = {"ujaran kebencian", "fitnah", "disinformasi", "neutral", "fake", "real"}
 
@@ -171,6 +171,49 @@ def compute_silero_vad(audio_path: Path, duration_sec: float) -> tuple[float, in
     return vad_ratio, len(speech_timestamps)
 
 
+def get_vad_segments(audio_path: Path) -> list[dict]:
+    try:
+        from silero_vad import get_speech_timestamps, read_audio
+    except ImportError as exc:
+        raise RuntimeError(
+            "Silero VAD is required for cleaner.py. Install it with its runtime dependencies, "
+            "for example: `uv pip install torch torchaudio silero-vad`."
+        ) from exc
+
+    model = get_silero_vad_model()
+    wav = read_audio(str(audio_path), sampling_rate=16000)
+    speech_timestamps = get_speech_timestamps(
+        wav,
+        model,
+        sampling_rate=16000,
+        return_seconds=True,
+    )
+    return speech_timestamps
+
+
+def extract_segment(
+    input_path: Path,
+    start_sec: float,
+    end_sec: float,
+    output_path: Path,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-ss",
+        str(start_sec),
+        "-to",
+        str(end_sec),
+        "-c",
+        "copy",
+        str(output_path),
+    ]
+    run_ffmpeg(cmd)
+
+
 def run_ffmpeg(args_list: list[str]) -> subprocess.CompletedProcess:
     result = subprocess.run(
         args_list,
@@ -284,16 +327,41 @@ def normalize_length(
 def denoise_audio(
     input_path: Path,
     output_path: Path,
+    method: str = "afftdn",
+    model_path: Path | None = None,
 ) -> None:
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(input_path),
-        "-af",
-        "afftdn=nf=-25",
-        str(output_path),
-    ]
+    if method == "rnnoise":
+        if model_path and model_path.exists():
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_path),
+                "-af",
+                f"arnndl=model={str(model_path)}",
+                str(output_path),
+            ]
+        else:
+            print("    Warning: RNNoise model not found, falling back to afftdn")
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_path),
+                "-af",
+                "afftdn=nf=-25",
+                str(output_path),
+            ]
+    else:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_path),
+            "-af",
+            "afftdn=nf=-25",
+            str(output_path),
+        ]
     run_ffmpeg(cmd)
 
 
@@ -371,7 +439,10 @@ def process_audio(
         if args.denoise:
             ensure_standardized()
             denoised = make_temp_wav()
-            denoise_audio(current, denoised)
+            model_path = Path(args.denoise_model) if args.denoise_model else None
+            denoise_audio(
+                current, denoised, method=args.denoise_method, model_path=model_path
+            )
             current = denoised
 
         if args.length_normalize:
@@ -473,15 +544,15 @@ def should_keep(
             return False, f"invalid-label:{label}"
 
     file_size_mb = file_size_bytes / (1024 * 1024)
-    if file_size_mb < args.min_size_mb:
+    if args.min_size_mb is not None and file_size_mb < args.min_size_mb:
         return False, f"too-small:{file_size_mb:.2f}MB"
-    if file_size_mb > args.max_size_mb:
+    if args.max_size_mb is not None and file_size_mb > args.max_size_mb:
         return False, f"too-large:{file_size_mb:.2f}MB"
 
     duration = float(audio_info.get("measured_duration_sec") or 0.0)
-    if duration < args.min_duration:
+    if args.min_duration is not None and duration < args.min_duration:
         return False, f"too-short:{duration:.2f}s"
-    if duration > args.max_duration:
+    if args.max_duration is not None and duration > args.max_duration:
         return False, f"too-long:{duration:.2f}s"
 
     if args.audio_check:
@@ -658,9 +729,27 @@ def main() -> None:
         help="Apply noise reduction to audio",
     )
     parser.add_argument(
+        "--denoise-method",
+        type=str,
+        default="afftdn",
+        choices=["afftdn", "rnnoise"],
+        help="Noise reduction method (default: afftdn)",
+    )
+    parser.add_argument(
+        "--denoise-model",
+        type=str,
+        default=None,
+        help="Path to RNNoise model file (.rnnn). Required if --denoise-method=rnnoise",
+    )
+    parser.add_argument(
         "--validate-labels",
         action="store_true",
         help="Validate that labels are from the allowed set",
+    )
+    parser.add_argument(
+        "--split-vad-segments",
+        action="store_true",
+        help="Split audio into separate VAD segments and save with timestamps",
     )
     parser.set_defaults(audio_check=True)
     parser.set_defaults(vad_check=True)
@@ -767,23 +856,116 @@ def main() -> None:
             continue
 
         output_name = safe_output_name(audio_path, seen_output_names)
-        output_path = output_audio_dir / output_name
 
-        processed, processing_error = process_audio(audio_path, output_path, args)
-        if not processed:
-            if processing_error:
-                enriched["filter_reason"] = f"audio-processing-failed:{processing_error}"
-            else:
-                enriched["filter_reason"] = "audio-processing-failed"
-            rejected_rows.append(enriched)
-            continue
+        if args.split_vad_segments and audio_path and audio_path.exists():
+            print(f"Processing VAD split for: {audio_path.name}")
+            try:
+                vad_segments = get_vad_segments(audio_path)
+                print(f"  Found {len(vad_segments)} VAD segments")
+                if vad_segments:
+                    segments_kept = 0
+                    for seg_idx, seg in enumerate(vad_segments):
+                        seg_start = float(seg.get("start", 0.0))
+                        seg_end = float(seg.get("end", 0.0))
+                        seg_duration = seg_end - seg_start
 
-        if dedupe_key:
-            seen_entries.add(dedupe_key)
+                        print(
+                            f"  Segment {seg_idx}: {seg_start:.2f}s - {seg_end:.2f}s ({seg_duration:.2f}s)"
+                        )
 
-        enriched["filename"] = str(output_path)
-        enriched["filter_reason"] = "kept"
-        kept_rows.append(enriched)
+                        if seg_duration < args.min_duration:
+                            print(f"    Skipped (too short, min={args.min_duration}s)")
+                            continue
+
+                        seg_enriched = dict(enriched)
+                        base_name = Path(output_name).stem
+                        seg_name = f"{base_name}_seg{seg_idx:03d}.wav"
+                        seg_output_path = output_audio_dir / seg_name
+
+                        extract_segment(audio_path, seg_start, seg_end, seg_output_path)
+
+                        seg_info = inspect_audio(seg_output_path)
+                        seg_enriched["filename"] = str(seg_output_path)
+                        seg_enriched["file_size_bytes"] = seg_output_path.stat().st_size
+                        seg_enriched["sample_rate"] = seg_info.get("sample_rate", "")
+                        seg_enriched["channels"] = seg_info.get("channels", "")
+                        seg_enriched["peak"] = seg_info.get("peak", "")
+                        seg_enriched["rms"] = seg_info.get("rms", "")
+                        seg_enriched["clip_ratio"] = seg_info.get("clip_ratio", "")
+                        seg_enriched["segment_index"] = seg_idx
+                        seg_enriched["segment_start_sec"] = seg_start
+                        seg_enriched["segment_end_sec"] = seg_end
+                        seg_enriched["measured_duration_sec"] = round(seg_duration, 3)
+                        seg_enriched["filter_reason"] = "kept"
+                        kept_rows.append(seg_enriched)
+                        segments_kept += 1
+                        print(
+                            f"    Saved: {seg_name} ({seg_info.get('rms', '?')} RMS, {seg_info.get('peak', '?')} peak)"
+                        )
+
+                    if segments_kept == 0:
+                        print(
+                            f"  No segments met min-duration, falling back to full audio"
+                        )
+                        output_path = output_audio_dir / output_name
+                        processed, processing_error = process_audio(
+                            audio_path, output_path, args
+                        )
+                        if not processed:
+                            enriched["filter_reason"] = (
+                                f"audio-processing-failed:{processing_error}"
+                            )
+                            rejected_rows.append(enriched)
+                            continue
+
+                        enriched["filename"] = str(output_path)
+                        enriched["filter_reason"] = "kept"
+                        kept_rows.append(enriched)
+                else:
+                    print(f"  No speech detected, copying full audio")
+                    output_path = output_audio_dir / output_name
+                    processed, processing_error = process_audio(
+                        audio_path, output_path, args
+                    )
+                    if not processed:
+                        enriched["filter_reason"] = (
+                            f"audio-processing-failed:{processing_error}"
+                        )
+                        rejected_rows.append(enriched)
+                        continue
+
+                    if dedupe_key:
+                        seen_entries.add(dedupe_key)
+
+                    enriched["filename"] = str(output_path)
+                    enriched["filter_reason"] = "kept"
+                    kept_rows.append(enriched)
+            except Exception as exc:
+                print(f"  ERROR: {exc}")
+                enriched["filter_reason"] = f"vad-split-failed:{exc}"
+                rejected_rows.append(enriched)
+                continue
+        else:
+            output_name = safe_output_name(audio_path, seen_output_names)
+            output_path = output_audio_dir / output_name
+
+            processed, processing_error = process_audio(audio_path, output_path, args)
+            if not processed:
+                if processing_error:
+                    enriched["filter_reason"] = (
+                        f"audio-processing-failed:{processing_error}"
+                    )
+                else:
+                    enriched["filter_reason"] = "audio-processing-failed"
+                rejected_rows.append(enriched)
+                continue
+
+            if dedupe_key:
+                seen_entries.add(dedupe_key)
+
+            enriched["filename"] = str(output_path)
+            enriched["filter_reason"] = "kept"
+            kept_rows.append(enriched)
 
         if index % 25 == 0:
             print(f"Processed {index}/{len(rows)} rows...")
@@ -802,6 +984,9 @@ def main() -> None:
         "vad_segments",
         "vad_error",
         "filter_reason",
+        "segment_index",
+        "segment_start_sec",
+        "segment_end_sec",
     ]
     fieldnames = base_fields + [
         field for field in extra_fields if field not in base_fields
