@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Speech-to-text transcription CLI using Qwen3 ASR.
 
@@ -6,7 +6,8 @@ Usage:
     python stt.py audio.wav
     python stt.py audio.wav --output transcript.txt
     python stt.py ./dataset/raw --output ./transcripts
-    python stt.py audio.wav --model Qwen/Qwen3-ASR-0.6B
+    python stt.py ./dataset/raw --output ./transcripts --batch-size 8
+    python stt.py audio.wav --model Qwen/Qwen3-ASR-0.6B --batch-size 4
 """
 
 import argparse
@@ -80,15 +81,17 @@ def resolve_output_path(
     return output / relative.with_suffix(".txt")
 
 
-def transcribe_file(transcriber, audio_path: Path, language: str = None):
+def transcribe_batch(transcriber, audio_paths: list[Path], language: str = None):
+    audio_list = [str(p) for p in audio_paths]
     results = transcriber.transcribe(
-        str(audio_path),
+        audio_list,
         language=language,
     )
-    return results[0].text.strip()
+    return [r.text.strip() for r in results]
 
 
 def run(args) -> None:
+    batch_size = args.batch_size
     input_path = Path(args.input)
     if not input_path.exists():
         print(f"Error: Input not found: {input_path}")
@@ -114,17 +117,23 @@ def run(args) -> None:
     transcriber = get_transcriber(args.model)
     failures = 0
 
-    for index, audio_path in enumerate(audio_files, 1):
-        destination = resolve_output_path(audio_path, input_path, output_path, multiple)
-        print(f"[{index}/{len(audio_files)}] Transcribing {audio_path}")
+    for i in range(0, len(audio_files), batch_size):
+        batch = audio_files[i : i + batch_size]
+        print(
+            f"[{i + 1}-{min(i + batch_size, len(audio_files))}/{len(audio_files)}] Transcribing batch..."
+        )
         try:
-            text = transcribe_file(transcriber, audio_path, args.language)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_text(text, encoding="utf-8")
-            print(f"  Saved: {destination}")
+            texts = transcribe_batch(transcriber, batch, args.language)
+            for audio_path, text in zip(batch, texts):
+                destination = resolve_output_path(
+                    audio_path, input_path, output_path, multiple
+                )
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(text, encoding="utf-8")
+                print(f"  Saved: {destination}")
         except Exception as exc:
-            failures += 1
-            print(f"  Failed: {exc}")
+            failures += len(batch)
+            print(f"  Batch failed: {exc}")
 
     if failures:
         sys.exit(1)
@@ -149,6 +158,13 @@ def main():
         "--recursive",
         action="store_true",
         help="Recursively scan directories for audio files",
+    )
+    parser.add_argument(
+        "--batch-size",
+        "-b",
+        type=int,
+        default=1,
+        help="Batch size for transcription (default: 1)",
     )
     run(parser.parse_args())
 
