@@ -37,10 +37,18 @@ import sys
 import argparse
 import asyncio
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from urllib.parse import quote_plus, urljoin, urlparse
 
 import httpx
+
+try:
+    from playwright.async_api import async_playwright
+
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 
 
 def setup_logging(log_file: str | None = None, level: int = logging.INFO):
@@ -68,12 +76,21 @@ DEFAULT_TARGET = 100
 DEFAULT_DELAY = 2.0
 DEFAULT_CONCURRENCY = 8
 MAX_PAGES_PER_TAG = 1
+DEFAULT_STRATEGY = "site"
 
-LABELS = ["ujaran kebencian", "fitnah", "disinformasi", "neutral"]
+LABELS = [
+    "ujaran kebencian",
+    "fitnah",
+    "disinformasi",
+    "neutral",
+]
 
 PAGINATION_QUERY = "query"  # ?page=N
 PAGINATION_PATH = "path"  # /N
 PAGINATION_BOTH = "both"  # try both styles
+
+DEFAULT_USE_PLAYWRIGHT = False
+PLAYWRIGHT_BROWSER = None
 
 HEADERS = {
     "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
@@ -115,27 +132,84 @@ NEUTRAL_PLATFORM_SEARCHES = [
     ("youtube", "https://www.youtube.com/results?search_query={query}"),
     ("tiktok", "https://www.tiktok.com/search?q={query}"),
     ("instagram", "https://www.instagram.com/explore/search/keyword/?q={query}"),
-    ("twitter", "https://x.com/search?q={query}&src=typed_query&f=live"),
+    (
+        "twitter",
+        "https://x.com/search?q=filter%3Avideos%20lang%3Aid%20{query}&src=typed_query&f=live",
+    ),
     ("facebook", "https://www.facebook.com/search/videos?q={query}"),
 ]
 
-TAG_TO_LABEL = {
+QUERY_PLATFORM_SEARCHES = [
+    ("tiktok", "https://www.tiktok.com/search?q={query}"),
+    ("instagram", "https://www.instagram.com/explore/search/keyword/?q={query}"),
+    (
+        "twitter",
+        "https://x.com/search?q=filter%3Avideos%20lang%3Aid%20{query}&src=typed_query&f=live",
+    ),
+    ("facebook", "https://www.facebook.com/search/videos?q={query}"),
+    ("youtube", "https://www.youtube.com/results?search_query={query}"),
+    ("google", "https://www.google.com/search?q={query}&lr=lang_id&tbm=vid"),
+]
+
+QUERY_KEYWORDS = {
     "disinformasi": [
-        "hoax",
-        "hoaks",
-        "misinformasi",
-        "disinformasi",
-        "fakta",
-        "cek fakta",
-        "cekfakta",
-        "klarifikasi",
-        "fact check",
-        "kabar bohong",
-        "berita palsu",
-        "informasi palsu",
-        "klikbait",
-        "salah kapih",
-        "misleading",
+        "hoaks indonesia",
+        "hoax indonesia",
+        "cek fakta hoaks",
+        "klarifikasi hoaks",
+        "berita palsu indonesia",
+        "informasi palsu viral",
+        "misinformasi indonesia",
+        "disinformasi indonesia",
+        "kabar bohong viral",
+        "fakta atau hoaks",
+        "turn back hoax",
+    ],
+    "fitnah": [
+        "fitnah indonesia",
+        "fitnah politik",
+        "pencemaran nama baik",
+        "tuduhan palsu",
+        "adu domba",
+        "black campaign",
+        "kampanye hitam",
+        "serangan pribadi",
+    ],
+    "ujaran kebencian": [
+        "ujaran kebencian",
+        "sara indonesia",
+        "rasisme viral",
+        "intoleransi",
+        "diskriminasi",
+        "hate speech indonesia",
+        "provokasi sara",
+        "konten kebencian",
+    ],
+    "neutral": [
+        "berita terbaru",
+        "berita indonesia",
+        "video viral indonesia",
+        "berita jakarta",
+        "peristiwa hari ini",
+        "lifestyle indonesia",
+    ],
+}
+
+TAG_TO_LABEL = {
+    "ujaran kebencian": [
+        "ujaran kebencian",
+        "hate speech",
+        "sara",
+        "rasisme",
+        "intoleransi",
+        "diskriminasi",
+        "xenofobia",
+        "bigotri",
+        "ekstremisme",
+        "radikalisasi",
+        "perpecahan",
+        "permusuhan",
+        "kebencian",
     ],
     "fitnah": [
         "fitnah",
@@ -149,22 +223,31 @@ TAG_TO_LABEL = {
         "serangan pribadi",
         "character assassination",
     ],
-    "ujaran kebencian": [
-        "ujaran kebencian",
-        "hate speech",
-        "SARA",
-        "rasisme",
-        "intoleransi",
-        "diskriminasi",
-        "xenofobia",
-        "bigotri",
-        "ekstremisme",
-        "radikalisasi",
-        "perpecahan",
-        "permusuhan",
-        "kebencian",
+    "disinformasi": [
+        "hoax",
+        "hoaks",
+        "misinformasi",
+        "disinformasi",
+        "cek fakta",
+        "cekfakta",
+        "hoaks atau fakta",
+        "fakta atau hoaks",
+        "klarifikasi",
+        "fact check",
+        "kabar bohong",
+        "berita palsu",
+        "informasi palsu",
+        "klikbait",
+        "salah kaprah",
+        "misleading",
     ],
 }
+
+TAG_LABEL_PRIORITY = [
+    "ujaran kebencian",
+    "fitnah",
+    "disinformasi",
+]
 
 CSV_FIELDS = [
     "id",
@@ -174,6 +257,7 @@ CSV_FIELDS = [
     "keyword",
     "discovered_at",
     "weak_label",
+    "strategy",
 ]
 
 PLATFORM_MAP = {
@@ -350,6 +434,21 @@ def normalize_tags(tags: list[str]) -> list[str]:
     return cleaned
 
 
+def normalize_tag_text(tag: str) -> str:
+    tag = (tag or "").lower().strip()
+    tag = tag.replace("%20", " ").replace("-", " ").replace("_", " ")
+    tag = re.sub(r"[^a-z0-9\s]", " ", tag)
+    return re.sub(r"\s+", " ", tag).strip()
+
+
+def build_normalized_signal_map(signal_map: dict[str, list[str]]) -> dict[str, list[str]]:
+    return {
+        key: [normalized for value in values if (normalized := normalize_tag_text(value))]
+        for key, values in signal_map.items()
+    }
+
+
+NORMALIZED_TAG_TO_LABEL = build_normalized_signal_map(TAG_TO_LABEL)
 def build_keyword_from_tags(tags: list[str]) -> str:
     normalized_tags = normalize_tags(tags)
     if not normalized_tags:
@@ -379,7 +478,7 @@ def normalize_video_url(url: str) -> str:
     url = url.strip()
 
     yt = re.search(
-        r"(?:youtube\.com/(?:embed/|watch\?v=)|m\.youtube\.com/watch\?v=|youtu\.be/)([\w-]{11})",
+        r"(?:youtube\.com/(?:embed/|watch\?v=|shorts/)|m\.youtube\.com/watch\?v=|youtu\.be/)([\w-]{11})",
         url,
     )
     if yt:
@@ -454,7 +553,25 @@ def _extract_video_urls_generic(html: str, base_url: str) -> set[str]:
     ):
         urls.add(f"https://www.youtube.com/watch?v={m.group(1)}")
 
-    # TikTok embeds
+    # YouTube: extract from innerTube JSON response (for search results pages)
+    for m in re.finditer(r'"videoId":"([\w-]{11})"', html):
+        urls.add(f"https://www.youtube.com/watch?v={m.group(1)}")
+    for m in re.finditer(r'"url":"/watch\?v=([\w-]{11})"', html):
+        urls.add(f"https://www.youtube.com/watch?v={m.group(1)}")
+
+    # TikTok: various patterns from search results and embeds
+    # TikTok video IDs are typically 19 digits
+    for m in re.finditer(r'"videoId":"(\d{19})"', html):
+        urls.add(f"https://www.tiktok.com/@user/video/{m.group(1)}")
+    for m in re.finditer(r'"id":"(\d{19})"', html):
+        urls.add(f"https://www.tiktok.com/@user/video/{m.group(1)}")
+    for m in re.finditer(r'tiktok\.com/[^"\'>\s]+/video/(\d+)', html):
+        full = m.group(0)
+        if not full.startswith("http"):
+            full = "https://www." + full.lstrip("/")
+        urls.add(full.split("?")[0])
+
+    # TikTok embeds (alternative pattern)
     for m in re.finditer(r'tiktok\.com/[^"\'>\s]+/video/(\d+)', html):
         urls.add(normalize_video_url(m.group(0)))
     for m in re.finditer(r'(?:vm|vt)\.tiktok\.com/[^"\'>\s/]+/?', html):
@@ -476,9 +593,43 @@ def _extract_video_urls_generic(html: str, base_url: str) -> set[str]:
     for m in re.finditer(r"(?:twitter|x)\.com/\w+/status/(\d+)", html):
         urls.add(f"https://x.com/i/web/status/{m.group(1)}")
 
+    # Google video search results - extract redirected video URLs
+    for m in re.finditer(r'/url\?url=([^&"]+)', html):
+        try:
+            from urllib.parse import unquote
+
+            redirect_url = unquote(m.group(1))
+            if re.search(
+                r"(?:youtube\.com/(?:watch\?v=|embed/|shorts/)|m\.youtube\.com/watch\?v=|youtu\.be/|"
+                r"tiktok\.com/.+/video/|(?:vm|vt)\.tiktok\.com/|"
+                r"(?:facebook\.com|fb\.com|fb\.watch).*(?:/videos/|watch\?v=|/reel/)|"
+                r"instagram\.com/(?:reel|p)/|"
+                r"(?:twitter|x)\.com/\w+/status/)",
+                redirect_url,
+            ):
+                urls.add(normalize_video_url(redirect_url))
+        except Exception:
+            pass
+
+    # Direct video links from Google results
+    for m in re.finditer(
+        r'(?:youtube\.com|tiktok\.com|facebook\.com|instagram\.com|twitter\.com|x\.com)[^"\'<>\s]+',
+        html,
+    ):
+        href = m.group(0)
+        if re.search(
+            r"(?:youtube\.com/(?:watch\?v=|embed/|shorts/)|m\.youtube\.com/watch\?v=|youtu\.be/|"
+            r"tiktok\.com/.+/video/|(?:vm|vt)\.tiktok\.com/|"
+            r"(?:facebook\.com|fb\.com|fb\.watch).*(?:/videos/|watch\?v=|/reel/)|"
+            r"instagram\.com/(?:reel|p)/|"
+            r"(?:twitter|x)\.com/\w+/status/)",
+            href,
+        ):
+            urls.add(normalize_video_url(href))
+
     for href in _extract_anchor_hrefs(html, base_url):
         if re.search(
-            r"(?:youtube\.com/(?:watch\?v=|embed/)|m\.youtube\.com/watch\?v=|youtu\.be/|"
+            r"(?:youtube\.com/(?:watch\?v=|embed/|shorts/)|m\.youtube\.com/watch\?v=|youtu\.be/|"
             r"tiktok\.com/.+/video/|(?:vm|vt)\.tiktok\.com/|"
             r"(?:facebook\.com|fb\.com|fb\.watch).*(?:/videos/|watch\?v=|/reel/)|"
             r"instagram\.com/(?:reel|p)/|"
@@ -529,12 +680,28 @@ def extract_video_urls_from_html(html: str, base_url: str) -> list[str]:
 
 
 def classify_by_tags(tags: list[str]) -> str:
-    tags_lower = [t.lower() for t in normalize_tags(tags)]
-    for label, patterns in TAG_TO_LABEL.items():
-        for tag in tags_lower:
+    normalized_tags = [normalize_tag_text(tag) for tag in normalize_tags(tags)]
+    scores = {label: 0 for label in NORMALIZED_TAG_TO_LABEL}
+
+    for tag in normalized_tags:
+        if not tag:
+            continue
+        padded_tag = f" {tag} "
+        for label, patterns in NORMALIZED_TAG_TO_LABEL.items():
             for pattern in patterns:
-                if pattern in tag:
-                    return label
+                padded_pattern = f" {pattern} "
+                if padded_tag == padded_pattern:
+                    scores[label] += 3
+                elif padded_pattern in padded_tag:
+                    scores[label] += 1
+
+    best_score = max(scores.values(), default=0)
+    if best_score <= 0:
+        return "neutral"
+
+    for label in TAG_LABEL_PRIORITY:
+        if scores.get(label, 0) == best_score:
+            return label
     return "neutral"
 
 
@@ -560,13 +727,17 @@ async def fetch(client: httpx.AsyncClient, url: str, retries: int = 4) -> str | 
             )
 
             if resp.status_code == 429:
-                wait = (2**attempt) * random.uniform(5, 10)  # exponential backoff
+                wait = (2**attempt) * random.uniform(30, 40)
                 log.warning(f"Rate limited on {url}. Waiting {wait:.1f}s...")
                 await asyncio.sleep(wait)
                 continue
 
             if resp.status_code == 403:
-                log.warning(f"403 Forbidden: {url}. Skipping.")
+                log.info(f"403 Forbidden: {url}. Trying Playwright...")
+                if PLAYWRIGHT_AVAILABLE and PLAYWRIGHT_BROWSER:
+                    pw_result = await fetch_with_playwright(url)
+                    if pw_result:
+                        return pw_result
                 return None
 
             if resp.status_code < 400:
@@ -584,7 +755,35 @@ async def fetch(client: httpx.AsyncClient, url: str, retries: int = 4) -> str | 
             log.debug(f"Fetch failed [{url}]: {e}")
             return None
 
-    log.warning(f"All {retries} attempts failed for {url}")
+    log.info(f"All {retries} attempts failed for {url}")
+    return None
+
+
+async def fetch_with_playwright(url: str, retries: int = 3) -> str | None:
+    if not PLAYWRIGHT_AVAILABLE:
+        log.warning(
+            "Playwright not installed. Run: pip install playwright && playwright install chromium"
+        )
+        return None
+
+    for attempt in range(retries):
+        browser = None
+        try:
+            browser = await PLAYWRIGHT_BROWSER.new_page()
+            await browser.goto(url, wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(random.uniform(1, 3))
+            content = await browser.content()
+            await browser.close()
+            return content
+        except Exception as e:
+            log.debug(f"Playwright attempt {attempt + 1} failed for {url}: {e}")
+            if browser:
+                try:
+                    await browser.close()
+                except:
+                    pass
+            await asyncio.sleep(2)
+    log.info(f"All {retries} playwright attempts failed for {url}")
     return None
 
 
@@ -832,62 +1031,59 @@ async def scrape_neutral_platform_searches(
     )
 
 
-# ── Site Scrapers (now config-driven) ─────────────────────────────────────────
-
-
-async def scrape_turnbackhoax(
+async def run_query_strategy(
     client: httpx.AsyncClient,
+    queries: list[str],
     remaining_per_label: dict[str, int],
     concurrency: int = DEFAULT_CONCURRENCY,
-    max_pages: int = MAX_PAGES_PER_TAG,
+    active_labels: list[str] | None = None,
+    label_specific: bool = False,
 ) -> list[dict]:
-    return await scrape_site_from_config(
-        client, "turnbackhoax", remaining_per_label, concurrency, max_pages
-    )
+    if active_labels is None:
+        active_labels = LABELS
 
+    if queries:
+        if label_specific and len(active_labels) == 1:
+            label_queries = {active_labels[0]: list(queries)}
+        else:
+            label_queries = {label: list(queries) for label in active_labels}
+    else:
+        label_queries = {
+            label: QUERY_KEYWORDS.get(label, []) for label in active_labels
+        }
 
-async def scrape_kompas(
-    client: httpx.AsyncClient,
-    remaining_per_label: dict[str, int],
-    concurrency: int = DEFAULT_CONCURRENCY,
-    max_pages: int = MAX_PAGES_PER_TAG,
-) -> list[dict]:
-    return await scrape_site_from_config(
-        client, "kompas", remaining_per_label, concurrency, max_pages
-    )
+    all_queries = [q for qs in label_queries.values() for q in qs]
+    if all_queries:
+        log.info(f"Using queries: {all_queries[:10]}...")
+    else:
+        log.warning("No queries available for query strategy")
+        return []
 
+    search_jobs = []
+    seen_search_urls = set()
 
-async def scrape_detik(
-    client: httpx.AsyncClient,
-    remaining_per_label: dict[str, int],
-    concurrency: int = DEFAULT_CONCURRENCY,
-    max_pages: int = MAX_PAGES_PER_TAG,
-) -> list[dict]:
-    return await scrape_site_from_config(
-        client, "detik", remaining_per_label, concurrency, max_pages
-    )
+    for label, query_list in label_queries.items():
+        remaining = remaining_per_label.get(label, 0)
+        if remaining <= 0:
+            continue
+        for query in query_list:
+            encoded = quote_plus(query)
+            for platform, template in QUERY_PLATFORM_SEARCHES:
+                search_url = template.format(query=encoded)
+                if search_url in seen_search_urls:
+                    continue
+                seen_search_urls.add(search_url)
+                search_jobs.append(
+                    (search_url, label, build_search_keyword(query, platform))
+                )
 
+    if not search_jobs:
+        return []
 
-async def scrape_liputan6(
-    client: httpx.AsyncClient,
-    remaining_per_label: dict[str, int],
-    concurrency: int = DEFAULT_CONCURRENCY,
-    max_pages: int = MAX_PAGES_PER_TAG,
-) -> list[dict]:
-    return await scrape_site_from_config(
-        client, "liputan6", remaining_per_label, concurrency, max_pages
-    )
-
-
-async def scrape_cnnindonesia(
-    client: httpx.AsyncClient,
-    remaining_per_label: dict[str, int],
-    concurrency: int = DEFAULT_CONCURRENCY,
-    max_pages: int = MAX_PAGES_PER_TAG,
-) -> list[dict]:
-    return await scrape_site_from_config(
-        client, "cnnindonesia", remaining_per_label, concurrency, max_pages
-    )
+    log.info(f"  [query-strategy] fetching {len(search_jobs)} search pages")
+    results = await fetch_search_results(client, search_jobs, concurrency)
+    results = [r for r in results if r.get("label") in active_labels]
+    return results
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -930,6 +1126,7 @@ def save_results(
     seen_urls: set,
     target: int,
     active_labels: list[str],
+    strategy: str = "site",
 ) -> dict:
     per_label = {label: 0 for label in LABELS}
     _, existing = load_existing(csv_path)
@@ -956,6 +1153,7 @@ def save_results(
                 or r.get("fallback_keyword", ""),
                 "discovered_at": datetime.now().isoformat(timespec="seconds"),
                 "weak_label": label,
+                "strategy": strategy,
             }
         )
         per_label[label] += 1
@@ -967,11 +1165,8 @@ def save_results(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 SITE_SCRAPERS = {
-    "turnbackhoax": scrape_turnbackhoax,
-    "kompas": scrape_kompas,
-    "detik": scrape_detik,
-    "liputan6": scrape_liputan6,
-    "cnnindonesia": scrape_cnnindonesia,
+    site_name: partial(scrape_site_from_config, site_name=site_name)
+    for site_name in SITE_CONFIG
 }
 
 
@@ -983,54 +1178,130 @@ async def run(args):
     log.info(f"Target  : {args.target} per label")
     log.info(f"Sites   : {args.sites}")
     log.info(f"Labels  : {args.labels}")
+    log.info(f"Strategy: {args.strategy}")
     log.info(f"Concurrency: {args.concurrency}\n")
 
     async with httpx.AsyncClient(headers=HEADERS) as client:
-        for site_name in args.sites:
-            if all(per_label[label] >= args.target for label in args.labels):
-                log.info("All requested labels have reached target. Stopping early.")
-                break
-
-            remaining_per_label = remaining_label_targets(
-                per_label, args.labels, args.target
-            )
-
-            scraper_fn = SITE_SCRAPERS.get(site_name)
-            if not scraper_fn:
-                log.warning(f"Unknown site: {site_name}")
-                continue
-
-            log.info(f"{'=' * 55}")
-            log.info(f"Scraping: {site_name}")
-            log.info(f"{'=' * 55}")
-
-            site_results = await scraper_fn(
-                client, remaining_per_label, args.concurrency, args.max_pages
-            )
-            if remaining_per_label.get("neutral", 0) > 0:
-                neutral_results = await scrape_neutral_platform_searches(
-                    client,
-                    remaining_per_label,
-                    args.concurrency,
+        if args.strategy == "query":
+            max_iterations = 50
+            for iteration in range(1, max_iterations + 1):
+                remaining_per_label = remaining_label_targets(
+                    per_label, args.labels, args.target
                 )
-                if neutral_results:
+                if all(remaining <= 0 for remaining in remaining_per_label.values()):
                     log.info(
-                        f"  Added {len(neutral_results)} candidate URLs from direct platform searches"
+                        f"All labels reached target after {iteration - 1} iterations"
                     )
-                    site_results.extend(neutral_results)
-            site_results = [r for r in site_results if r.get("label") in args.labels]
-            log.info(f"  Found {len(site_results)} video URLs from {site_name}")
+                    break
 
-            per_label = save_results(
-                site_results,
-                csv_path,
-                seen_urls,
-                args.target,
-                args.labels,
-            )
-            for lbl in args.labels:
-                log.info(f"  {lbl}: {per_label[lbl]}/{args.target}")
-            await asyncio.sleep(args.delay)
+                log.info(f"{'=' * 55}")
+                log.info(
+                    f"Query Strategy iteration {iteration}: {args.query if args.query else '(default keywords)'}"
+                )
+                log.info(f"{'=' * 55}")
+
+                shuffled_queries = []
+                if args.query:
+                    shuffled_queries = list(args.query)
+                else:
+                    shuffled_queries = list(QUERY_KEYWORDS.keys())
+
+                random.shuffle(shuffled_queries)
+
+                all_results = []
+
+                for label in args.labels:
+                    if remaining_per_label.get(label, 0) <= 0:
+                        continue
+
+                    if args.query:
+                        label_specific_queries = list(args.query)
+                    else:
+                        label_specific_queries = list(QUERY_KEYWORDS.get(label, []))
+
+                    if not label_specific_queries:
+                        continue
+
+                    random.shuffle(label_specific_queries)
+
+                    query_results = await run_query_strategy(
+                        client,
+                        label_specific_queries,
+                        remaining_per_label,
+                        args.concurrency if not args.use_playwright else 2,
+                        [label],
+                        label_specific=True,
+                    )
+                    all_results.extend(query_results)
+
+                query_results = all_results
+                log.info(f"  Found {len(query_results)} video URLs from query searches")
+
+                per_label = save_results(
+                    query_results,
+                    csv_path,
+                    seen_urls,
+                    args.target,
+                    args.labels,
+                    strategy="query",
+                )
+                for lbl in args.labels:
+                    log.info(f"  {lbl}: {per_label[lbl]}/{args.target}")
+
+                if all(per_label[lbl] >= args.target for lbl in args.labels):
+                    break
+                await asyncio.sleep(1)
+        else:
+            for site_name in args.sites:
+                if all(per_label[label] >= args.target for label in args.labels):
+                    log.info(
+                        "All requested labels have reached target. Stopping early."
+                    )
+                    break
+
+                remaining_per_label = remaining_label_targets(
+                    per_label, args.labels, args.target
+                )
+
+                scraper_fn = SITE_SCRAPERS.get(site_name)
+                if not scraper_fn:
+                    log.warning(f"Unknown site: {site_name}")
+                    continue
+
+                log.info(f"{'=' * 55}")
+                log.info(f"Scraping: {site_name}")
+                log.info(f"{'=' * 55}")
+
+                site_results = await scraper_fn(
+                    client, remaining_per_label, args.concurrency, args.max_pages
+                )
+                if remaining_per_label.get("neutral", 0) > 0:
+                    neutral_results = await scrape_neutral_platform_searches(
+                        client,
+                        remaining_per_label,
+                        args.concurrency,
+                    )
+                    if neutral_results:
+                        log.info(
+                            f"  Added {len(neutral_results)} candidate URLs from direct platform searches"
+                        )
+                        site_results.extend(neutral_results)
+                site_results = [
+                    r for r in site_results if r.get("label") in args.labels
+                ]
+                log.info(f"  Found {len(site_results)} video URLs from {site_name}")
+
+                per_label = save_results(
+                    site_results,
+                    csv_path,
+                    seen_urls,
+                    args.target,
+                    args.labels,
+                    strategy="site",
+                )
+                for lbl in args.labels:
+                    log.info(f"  {lbl}: {per_label[lbl]}/{args.target}")
+                await asyncio.sleep(args.delay)
 
     _, final_counts = load_existing(csv_path)
     total = sum(final_counts.values())
@@ -1073,7 +1344,7 @@ def main():
         nargs="+",
         default=LABELS,
         choices=LABELS,
-        help="Labels to collect (default: all 4)",
+        help="Labels to collect (default: all labels)",
     )
     p.add_argument(
         "--delay",
@@ -1094,12 +1365,53 @@ def main():
         help=f"Max pagination pages per tag (default: {MAX_PAGES_PER_TAG})",
     )
     p.add_argument(
+        "--strategy",
+        type=str,
+        default=DEFAULT_STRATEGY,
+        choices=["site", "query"],
+        help=f"Search strategy: 'site' (scrape news sites) or 'query' (direct search queries) (default: {DEFAULT_STRATEGY})",
+    )
+    p.add_argument(
+        "--query",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Query keywords for query strategy (e.g., --query 'hoaks indonesia' 'fitnah politik')",
+    )
+    p.add_argument(
         "--log-file",
         type=str,
         default=None,
         help="Optional file to write logs to (in addition to stdout)",
     )
+    p.add_argument(
+        "--use-playwright",
+        action="store_true",
+        default=DEFAULT_USE_PLAYWRIGHT,
+        help="Use Playwright for fetching (bypasses 403 blocks on social platforms)",
+    )
     args = p.parse_args()
+
+    global PLAYWRIGHT_BROWSER
+    if args.use_playwright:
+        if not PLAYWRIGHT_AVAILABLE:
+            print(
+                "Error: Playwright not installed. Run: pip install playwright && playwright install chromium"
+            )
+            sys.exit(1)
+        import nest_asyncio
+
+        nest_asyncio.apply()
+
+        async def launch_browser():
+            global PLAYWRIGHT_BROWSER
+            pw = await async_playwright().start()
+            PLAYWRIGHT_BROWSER = await pw.chromium.launch(headless=True)
+
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(launch_browser())
+        log.info("Playwright browser launched successfully")
+
     setup_logging(args.log_file)
 
     if sys.platform == "win32":
