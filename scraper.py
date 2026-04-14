@@ -30,6 +30,11 @@ DEFAULT_AUDIO_DIR = "raw"
 DEFAULT_FORMAT = "wav"
 DEFAULT_DELAY = 0.5
 DEFAULT_WORKERS = 1
+DEFAULT_MAX_DURATION = 600
+DEFAULT_MIN_DURATION = 10
+DEFAULT_WINDOW_SIZE = 30
+DEFAULT_WINDOW_OVERLAP = 0
+DEFAULT_MIN_CHUNK_DURATION = 5
 
 OUTPUT_FIELDS = [
     "url",
@@ -45,6 +50,11 @@ OUTPUT_FIELDS = [
     "weak_label",
     "source_article",
     "keyword",
+    "strategy",
+    "chunk_index",
+    "chunk_start_sec",
+    "chunk_end_sec",
+    "parent_url",
 ]
 
 PLATFORM_MAP = {
@@ -64,7 +74,7 @@ PLATFORM_COOKIES = {
     "Twitter/X": "cookies/twitter_cookies.txt",
     "Facebook": "cookies/facebook_cookies.txt",
     "TikTok": "cookies/tiktok_cookies.txt",
-    "YouTube": None,
+    "YouTube": "cookies/youtube_cookies.txt",
 }
 
 
@@ -159,6 +169,7 @@ def build_ydl_opts(
         "sleep_interval": 2,
         "max_sleep_interval": 6,
         "sleep_interval_requests": 1,
+        "js_runtimes": {"node": {}},
     }
 
     if platform and not cookies_file and not cookies_browser:
@@ -204,6 +215,7 @@ def normalize_input_row(row: dict) -> dict:
     )
     normalized["source_article"] = normalized.get("source_article", "")
     normalized["keyword"] = normalized.get("keyword", "")
+    normalized["strategy"] = normalized.get("strategy", "")
     return normalized
 
 
@@ -216,18 +228,20 @@ def load_input_items(args) -> list[dict]:
         ]
 
     input_path = Path(args.url_file)
+    filter_labels = set(args.labels) if getattr(args, "labels", None) else None
     if input_path.suffix.lower() == ".csv":
         items = []
         with open(input_path, encoding="utf-8") as handle:
             reader = csv.DictReader(handle)
             for row in reader:
                 item = normalize_input_row(row)
-                if (
-                    item["url"]
-                    and not item["url"].startswith("#")
-                    and is_valid_video_url(item["url"])
-                ):
-                    items.append(item)
+                if not item["url"] or item["url"].startswith("#"):
+                    continue
+                if not is_valid_video_url(item["url"]):
+                    continue
+                if filter_labels and item.get("weak_label") not in filter_labels:
+                    continue
+                items.append(item)
         return items
 
     with open(input_path, encoding="utf-8") as handle:
@@ -256,18 +270,50 @@ def build_output_row(item: dict, result: dict) -> dict:
     row["weak_label"] = item.get("weak_label", "")
     row["source_article"] = item.get("source_article", "")
     row["keyword"] = item.get("keyword", "")
+    row["strategy"] = item.get("strategy", "")
     row["resolved_url"] = item.get("resolved_url", item["url"])
     row["scraped_at"] = datetime.now().isoformat(timespec="seconds")
     return row
 
 
+def build_output_rows(item: dict, result: dict) -> list[dict]:
+    base_row = build_output_row(item, result)
+    chunks = result.get("chunks") or []
+    if not chunks:
+        return [base_row]
+
+    rows = []
+    for chunk in chunks:
+        chunk_row = dict(base_row)
+        chunk_row.update(
+            {
+                "filename": chunk.get("filename", base_row.get("filename", "")),
+                "duration_sec": chunk.get(
+                    "duration_sec", base_row.get("duration_sec", "")
+                ),
+                "chunk_index": chunk.get("chunk_index", ""),
+                "chunk_start_sec": chunk.get("chunk_start_sec", ""),
+                "chunk_end_sec": chunk.get("chunk_end_sec", ""),
+                "parent_url": item["url"],
+            }
+        )
+        rows.append(chunk_row)
+    return rows
+
+
 def write_results_csv(
-    csv_path: Path, rows_by_url: dict[str, dict], input_order: list[dict]
+    csv_path: Path, rows_by_url: dict, input_order: list[dict]
 ) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    rows = [
-        rows_by_url[item["url"]] for item in input_order if item["url"] in rows_by_url
-    ]
+    rows = []
+    for item in input_order:
+        if item["url"] not in rows_by_url:
+            continue
+        stored = rows_by_url[item["url"]]
+        if isinstance(stored, list):
+            rows.extend(stored)
+        else:
+            rows.append(stored)
 
     extra_fields = []
     for row in rows:
@@ -276,14 +322,259 @@ def write_results_csv(
                 extra_fields.append(key)
 
     fieldnames = OUTPUT_FIELDS + sorted(extra_fields)
-    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+    exists = csv_path.exists()
+    mode = "a" if exists else "w"
+    with open(csv_path, mode, newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
+        if not exists:
+            writer.writeheader()
         writer.writerows(rows)
 
 
-def scrape_url(url: str, ydl_opts: dict, audio_dir: Path, retries: int = 3) -> dict:
+def extract_video_id(url: str) -> str | None:
+    # YouTube
+    m = re.search(r"(?:watch\?v=|embed/|shorts/)([\w-]{11})", url)
+    if m:
+        return m.group(1)
+    # TikTok
+    m = re.search(r"/video/(\d+)", url)
+    if m:
+        return m.group(1)
+    # Facebook
+    m = re.search(r"watch\?v=(\d+)", url)
+    if m:
+        return m.group(1)
+    # Instagram reel/p
+    m = re.search(r"instagram\.com/(?:reel|p)/([A-Za-z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    # Twitter/X
+    m = re.search(r"/status/(\d+)", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def get_duration(filepath: Path) -> str:
+    """Get audio duration using ffprobe."""
+    import subprocess
+
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(filepath),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and result.stdout.strip():
+            return str(int(float(result.stdout.strip())))
+    except Exception:
+        pass
+    return ""
+
+
+def split_audio_into_chunks(
+    input_path: Path,
+    output_dir: Path,
+    window_size: int,
+    overlap: int,
+    min_chunk_duration: int,
+    sample_rate: int = 16000,
+) -> list[dict]:
+    """Split audio into fixed-size windows. Returns list of chunk info dicts."""
+    import subprocess
+
+    duration = get_duration(input_path)
+    if not duration:
+        return []
+    duration = int(duration)
+
+    if duration < min_chunk_duration:
+        return []
+
+    chunks = []
+    step = window_size - overlap
+    chunk_index = 0
+
+    for start in range(0, duration, step):
+        end = min(start + window_size, duration)
+        chunk_duration = end - start
+
+        if chunk_duration < min_chunk_duration:
+            if chunks and start == 0:
+                pass
+            else:
+                break
+
+        output_name = f"{input_path.stem}_chunk{chunk_index:03d}{input_path.suffix}"
+        output_path = output_dir / output_name
+
+        try:
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(input_path),
+                "-ss",
+                str(start),
+                "-t",
+                str(chunk_duration),
+                "-ar",
+                str(sample_rate),
+                "-ac",
+                "1",
+                "-acodec",
+                "pcm_s16le",
+                str(output_path),
+            ]
+            subprocess.run(cmd, capture_output=True, check=True, timeout=60)
+
+            chunks.append(
+                {
+                    "filename": str(output_path),
+                    "chunk_index": chunk_index,
+                    "chunk_start_sec": start,
+                    "chunk_end_sec": end,
+                    "duration_sec": chunk_duration,
+                }
+            )
+        except Exception:
+            pass
+
+        chunk_index += 1
+
+        if end >= duration:
+            break
+
+    return chunks
+
+
+def regenerate_metadata(data_csv: Path, audio_dir: Path, output_csv: Path) -> int:
+    """Regenerate metadata by matching existing audio files to URLs."""
+    url_to_info = {}
+    with open(data_csv, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            url_to_info[row["url"]] = {
+                "label": row.get("weak_label", ""),
+                "source": row.get("source_article", ""),
+                "keyword": row.get("keyword", ""),
+                "discovered_at": row.get("discovered_at", ""),
+                "id": row.get("id", ""),
+            }
+
+    existing_files = {}
+    for f in audio_dir.iterdir():
+        if f.suffix.lower() in (".wav", ".mp3", ".mp4", ".m4a", ".flac", ".opus"):
+            existing_files[f.stem] = f
+
+    matched = []
+    for url in url_to_info:
+        vid = extract_video_id(url)
+        if not vid:
+            continue
+        for stem, path in existing_files.items():
+            if stem == vid or stem.startswith(vid + "-"):
+                info = url_to_info[url]
+                duration = get_duration(path)
+                matched.append(
+                    {
+                        "url": url,
+                        "platform": detect_platform(url),
+                        "title": "",
+                        "uploader": "",
+                        "duration_sec": duration,
+                        "filename": str(path),
+                        "status": "ok",
+                        "error": "",
+                        "scraped_at": datetime.now().isoformat(timespec="seconds"),
+                        "resolved_url": url,
+                        "weak_label": info["label"],
+                        "source_article": info["source"],
+                        "keyword": info["keyword"],
+                        "discovered_at": info["discovered_at"],
+                        "id": info["id"],
+                    }
+                )
+                break
+
+    if not matched:
+        print("No matching audio files found")
+        return 0
+
+    # Append to CSV - include discovered_at, id
+    fieldnames = OUTPUT_FIELDS + ["discovered_at", "id"]
+    exists = output_csv.exists()
+    mode = "a" if exists else "w"
+    with open(output_csv, mode, newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerows(matched)
+
+    print(f"Regenerated {len(matched)} metadata entries")
+    return len(matched)
+
+
+def get_video_duration(url: str, ydl_opts: dict) -> int | None:
+    """Get video duration without downloading."""
+    opts = dict(ydl_opts)
+    opts["skip_download"] = True
+    opts["quiet"] = True
+    opts["no_warnings"] = True
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info:
+                return info.get("duration")
+    except Exception:
+        pass
+    return None
+
+
+def check_duration_filter(
+    url: str, ydl_opts: dict, max_duration: int | None, min_duration: int | None
+) -> tuple[bool, str]:
+    """Check if video passes duration filters. Returns (passes, reason)."""
+    if max_duration is None and min_duration is None:
+        return True, ""
+
+    duration = get_video_duration(url, ydl_opts)
+    if duration is None:
+        return True, ""
+
+    if max_duration is not None and duration > max_duration:
+        return False, f"duration {duration}s exceeds max {max_duration}s"
+    if min_duration is not None and duration < min_duration:
+        return False, f"duration {duration}s below min {min_duration}s"
+
+    return True, ""
+
+
+def scrape_url(
+    url: str,
+    ydl_opts: dict,
+    audio_dir: Path,
+    retries: int = 3,
+    max_duration: int | None = None,
+    min_duration: int | None = None,
+    window_size: int | None = None,
+    window_overlap: int = 0,
+    min_chunk_duration: int = 5,
+    sample_rate: int = 16000,
+) -> dict:
     result = {"url": url, "status": "", "error": "", "filename": ""}
+
+    passes, reason = check_duration_filter(url, ydl_opts, max_duration, min_duration)
+    if not passes:
+        result["status"] = "skipped"
+        result["error"] = reason
+        return result
+
     current_ydl_opts = dict(ydl_opts)
     for attempt in range(retries):
         try:
@@ -310,6 +601,23 @@ def scrape_url(url: str, ydl_opts: dict, audio_dir: Path, retries: int = 3) -> d
                         "duration_sec": info.get("duration", ""),
                     }
                 )
+
+                if window_size:
+                    chunks = split_audio_into_chunks(
+                        final_path,
+                        audio_dir,
+                        window_size,
+                        window_overlap,
+                        min_chunk_duration,
+                        sample_rate,
+                    )
+                    if chunks:
+                        result["chunks"] = chunks
+                        try:
+                            final_path.unlink()
+                        except OSError:
+                            pass
+
                 return result
         except Exception as exc:
             error_text = strip_ansi(str(exc))
@@ -332,7 +640,7 @@ def scrape_url(url: str, ydl_opts: dict, audio_dir: Path, retries: int = 3) -> d
                     "there is no video in this post",
                     "no video could be found in this tweet",
                     "media #1 is not a video",
-                    "unsupported url: https://web.archive.org/",
+                    "unsupported url",
                     "removed for violating",
                     "removed by the uploader",
                     "terms of service",
@@ -389,9 +697,29 @@ def scrape_url(url: str, ydl_opts: dict, audio_dir: Path, retries: int = 3) -> d
 
 
 def scrape_url_worker(
-    url: str, ydl_opts: dict, audio_dir_str: str, retries: int = 3
+    url: str,
+    ydl_opts: dict,
+    audio_dir_str: str,
+    retries: int = 3,
+    max_duration: int | None = None,
+    min_duration: int | None = None,
+    window_size: int | None = None,
+    window_overlap: int = 0,
+    min_chunk_duration: int = 5,
+    sample_rate: int = 16000,
 ) -> dict:
-    return scrape_url(url, ydl_opts, Path(audio_dir_str), retries=retries)
+    return scrape_url(
+        url,
+        ydl_opts,
+        Path(audio_dir_str),
+        retries,
+        max_duration,
+        min_duration,
+        window_size,
+        window_overlap,
+        min_chunk_duration,
+        sample_rate,
+    )
 
 
 def terminate_executor_processes(executor: ProcessPoolExecutor | None) -> None:
@@ -468,6 +796,66 @@ def parse_args():
         default=DEFAULT_WORKERS,
         help=f"Number of concurrent workers (default: {DEFAULT_WORKERS})",
     )
+    parser.add_argument(
+        "--labels",
+        nargs="+",
+        choices=[
+            "ujaran kebencian",
+            "fitnah",
+            "disinformasi",
+            "neutral",
+            "fake",
+            "real",
+        ],
+        help="Filter by label(s) from CSV",
+    )
+    parser.add_argument(
+        "--max-per-label",
+        type=int,
+        default=None,
+        help="Maximum number of items to process per label (default: no limit)",
+    )
+    parser.add_argument(
+        "--regenerate",
+        action="store_true",
+        help="Regenerate metadata from existing audio files without re-downloading",
+    )
+    parser.add_argument(
+        "--max-duration",
+        type=int,
+        default=DEFAULT_MAX_DURATION,
+        help="Skip videos longer than N seconds",
+    )
+    parser.add_argument(
+        "--min-duration",
+        type=int,
+        default=DEFAULT_MIN_DURATION,
+        help="Skip videos shorter than N seconds",
+    )
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        default=DEFAULT_WINDOW_SIZE,
+        help="Window size in seconds for chunking audio (default: 30)",
+    )
+    parser.add_argument(
+        "--window-overlap",
+        type=int,
+        default=DEFAULT_WINDOW_OVERLAP,
+        help="Overlap between windows in seconds (default: 0)",
+    )
+    parser.add_argument(
+        "--min-chunk-duration",
+        type=int,
+        default=DEFAULT_MIN_CHUNK_DURATION,
+        help="Minimum chunk duration in seconds (default: 5)",
+    )
+    parser.add_argument(
+        "--sample-rate",
+        type=int,
+        default=16000,
+        help="Target sample rate for audio chunks (default: 16000)",
+    )
     return parser.parse_args()
 
 
@@ -481,6 +869,15 @@ def main():
     signal.signal(signal.SIGINT, handle_sigint)
 
     args = parse_args()
+
+    if args.regenerate:
+        data_csv = Path(args.url_file) if args.url_file else Path("data.csv")
+        audio_dir = Path(args.output) / args.audio_dir
+        csv_path = Path(args.csv) if args.csv else Path(args.output) / "metadata.csv"
+        print(f"Regenerating metadata from {audio_dir}")
+        regenerate_metadata(data_csv, audio_dir, csv_path)
+        return
+
     if not args.url_file and not args.urls:
         args.url_file = "data.csv"
 
@@ -501,35 +898,53 @@ def main():
     csv_path = Path(args.csv) if args.csv else output_dir / "metadata.csv"
 
     existing_rows = load_existing_rows(csv_path)
-    done_urls = {
+    permanently_done_urls = {
+        url for url, row in existing_rows.items() if row.get("status") == "ok"
+    }
+    failed_urls = {
         url
         for url, row in existing_rows.items()
-        if row.get("status") in {"ok", "blocked", "skipped"}
+        if row.get("status") in {"failed", "blocked", "skipped", "needs-login"}
     }
 
     print(f"Scraping {len(items)} URL(s)")
+    new_items = []
+    retry_items = []
+    label_counts = {label: 0 for label in (args.labels or [])}
+
+    for item in items:
+        url = item["url"]
+        label = item.get("weak_label", "")
+
+        if args.max_per_label and label in label_counts:
+            if label_counts[label] >= args.max_per_label:
+                continue
+            label_counts[label] += 1
+
+        if url in permanently_done_urls:
+            continue
+        if url in failed_urls:
+            retry_items.append(item)
+        else:
+            new_items.append(item)
+    pending_items = new_items + retry_items
+
+    print(f"  New URLs: {len(new_items)}, Retries: {len(retry_items)}")
     print(f"Audio dir : {audio_dir}")
     print(f"Format    : {args.format}")
     print(f"Workers   : {args.workers}")
+    if args.max_per_label:
+        print(f"Max/label : {args.max_per_label}")
     if args.proxy:
         print(f"Proxy     : {args.proxy}")
     print(f"CSV       : {csv_path}")
+    if args.window_size and args.window_size > 0:
+        print(
+            f"Chunking  : {args.window_size}s windows, {args.window_overlap}s overlap, {args.sample_rate}Hz"
+        )
     print("-" * 50)
 
     rows_by_url = {url: dict(row) for url, row in existing_rows.items()}
-    scheduled_urls = set(done_urls)
-    pending_items = []
-    for item in items:
-        url = item["url"]
-        if url in scheduled_urls:
-            if url not in rows_by_url:
-                rows_by_url[url] = build_output_row(
-                    item,
-                    {"url": url, "status": "duplicate", "error": "", "filename": ""},
-                )
-            continue
-        scheduled_urls.add(url)
-        pending_items.append(item)
 
     global active_executor
 
@@ -553,6 +968,12 @@ def main():
                     platform=detect_platform(item["url"]),
                 ),
                 str(audio_dir),
+                max_duration=args.max_duration,
+                min_duration=args.min_duration,
+                window_size=args.window_size,
+                window_overlap=args.window_overlap,
+                min_chunk_duration=args.min_chunk_duration,
+                sample_rate=args.sample_rate,
             ): item
             for item in pending_items
         }
@@ -569,7 +990,7 @@ def main():
             for future in done_futures:
                 item = futures[future]
                 result = future.result()
-                rows_by_url[item["url"]] = build_output_row(item, result)
+                rows_by_url[item["url"]] = build_output_rows(item, result)
                 completed += 1
                 if args.delay:
                     interruptible_sleep(args.delay)
