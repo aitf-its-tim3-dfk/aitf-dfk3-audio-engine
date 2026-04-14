@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Speech-to-text transcription CLI using Qwen3 ASR.
 
@@ -14,6 +14,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import gc
 import torch
 
 DEFAULT_MODEL = "Qwen/Qwen3-ASR-1.7B"
@@ -87,6 +88,8 @@ def transcribe_batch(transcriber, audio_paths: list[Path], language: str = None)
         audio_list,
         language=language,
     )
+    torch.cuda.empty_cache()
+    gc.collect()
     return [r.text.strip() for r in results]
 
 
