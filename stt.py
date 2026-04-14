@@ -1,12 +1,12 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-Speech-to-text transcription CLI using Hugging Face models.
+Speech-to-text transcription CLI using Qwen3 ASR.
 
 Usage:
     python stt.py audio.wav
     python stt.py audio.wav --output transcript.txt
     python stt.py ./dataset/raw --output ./transcripts
-    python stt.py audio.wav --model cahya/whisper-small-id
+    python stt.py audio.wav --model Qwen/Qwen3-ASR-0.6B
 """
 
 import argparse
@@ -14,10 +14,8 @@ import sys
 from pathlib import Path
 
 import torch
-from transformers import pipeline, AutoModelForSpeechSeq2Seq, AutoProcessor
 
-
-DEFAULT_MODEL = "cahya/whisper-medium-id"
+DEFAULT_MODEL = "Qwen/Qwen3-ASR-1.7B"
 SUPPORTED_EXTENSIONS = {
     ".wav",
     ".mp3",
@@ -34,46 +32,25 @@ SUPPORTED_EXTENSIONS = {
 CACHE_DIR = Path("models")
 
 
-def get_device():
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
-
-
-def load_model(model_name: str, device: str):
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_name,
-        cache_dir=CACHE_DIR,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-    )
-    processor = AutoProcessor.from_pretrained(model_name, cache_dir=CACHE_DIR)
-    return model, processor
-
-
 transcriber = None
 current_model = None
-current_device = None
 
 
 def get_transcriber(model_name: str):
-    global transcriber, current_model, current_device
-    device = get_device()
+    global transcriber, current_model
 
-    if current_model != model_name or current_device != device:
-        print(f"Loading model {model_name} on {device}...")
-        model, processor = load_model(model_name, device)
-        transcriber = pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            max_new_tokens=processor.model.config.max_new_tokens,
-            chunk_length_s=30,
-            batch_size=16,
-            device=device,
+    if current_model != model_name:
+        print(f"Loading model {model_name}...")
+        from qwen_asr import Qwen3ASRModel
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        transcriber = Qwen3ASRModel.from_pretrained(
+            model_name,
+            dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+            device_map=device,
+            max_new_tokens=1024,
         )
         current_model = model_name
-        current_device = device
 
     return transcriber
 
@@ -103,12 +80,12 @@ def resolve_output_path(
     return output / relative.with_suffix(".txt")
 
 
-def transcribe_file(transcriber, audio_path: Path):
-    result = transcriber(
+def transcribe_file(transcriber, audio_path: Path, language: str = None):
+    results = transcriber.transcribe(
         str(audio_path),
-        return_timestamps=False,
+        language=language,
     )
-    return result["text"].strip()
+    return results[0].text.strip()
 
 
 def run(args) -> None:
@@ -141,7 +118,7 @@ def run(args) -> None:
         destination = resolve_output_path(audio_path, input_path, output_path, multiple)
         print(f"[{index}/{len(audio_files)}] Transcribing {audio_path}")
         try:
-            text = transcribe_file(transcriber, audio_path)
+            text = transcribe_file(transcriber, audio_path, args.language)
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(text, encoding="utf-8")
             print(f"  Saved: {destination}")
@@ -161,6 +138,12 @@ def main():
         "--model",
         default=DEFAULT_MODEL,
         help=f"Transcription model (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--language",
+        "-l",
+        default=None,
+        help="Language for transcription (e.g., 'Indonesian', 'English'). Auto-detected if not specified",
     )
     parser.add_argument(
         "--recursive",
