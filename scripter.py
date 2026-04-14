@@ -14,6 +14,7 @@ Usage:
     python scripter.py
 """
 
+import argparse
 import html
 import json
 import os
@@ -30,21 +31,88 @@ from typing import Optional
 # ── Config ────────────────────────────────────────────────────────────────────
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL = "anthropic/claude-3.5-sonnet"
 
-N = 1000
-BATCH_SIZE = 100
+DEFAULT_MODEL = "anthropic/claude-3.5-sonnet"
+DEFAULT_N = 1000
+DEFAULT_BATCH_SIZE = 100
+DEFAULT_OUTPUT_FILE = "scripts.json"
+CHECKPOINT_FILE = "scripts_checkpoint.json"
 
-OUTPUT_FILE = "scripts.json"
-CHECKPOINT_FILE = "scripts_checkpoint.json"  # incremental saves go here
+DEFAULT_CONTEXT_POOL_SIZE = None
+DEFAULT_FEEDS_PER_RUN = 8
+DEFAULT_CONTEXT_PER_BATCH = 10
 
-CONTEXT_POOL_SIZE = None  # total headlines fetched into pool
-FEEDS_PER_RUN = 8  # how many feeds to sample each run
-CONTEXT_PER_BATCH = 10  # headlines shown per individual API call
+DEFAULT_MAX_RETRIES = 10
+DEFAULT_RETRY_DELAY = 60
+DEFAULT_CALL_DELAY = 60
 
-MAX_RETRIES = 10
-RETRY_DELAY = 60
-CALL_DELAY = 60
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate TTS scripts via OpenRouter API."
+    )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=DEFAULT_N,
+        help=f"Items per label (default: {DEFAULT_N})",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Batch size (default: {DEFAULT_BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL,
+        help=f"Model (default: {DEFAULT_MODEL})",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=DEFAULT_OUTPUT_FILE,
+        help=f"Output file (default: {DEFAULT_OUTPUT_FILE})",
+    )
+    parser.add_argument(
+        "--context-pool-size",
+        type=int,
+        default=DEFAULT_CONTEXT_POOL_SIZE,
+        help="Total headlines in pool (default: all)",
+    )
+    parser.add_argument(
+        "--feeds-per-run",
+        type=int,
+        default=DEFAULT_FEEDS_PER_RUN,
+        help=f"Feeds to sample (default: {DEFAULT_FEEDS_PER_RUN})",
+    )
+    parser.add_argument(
+        "--context-per-batch",
+        type=int,
+        default=DEFAULT_CONTEXT_PER_BATCH,
+        help=f"Headlines per batch (default: {DEFAULT_CONTEXT_PER_BATCH})",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES,
+        help=f"Max retries per batch (default: {DEFAULT_MAX_RETRIES})",
+    )
+    parser.add_argument(
+        "--retry-delay",
+        type=int,
+        default=DEFAULT_RETRY_DELAY,
+        help=f"Retry delay in seconds (default: {DEFAULT_RETRY_DELAY})",
+    )
+    parser.add_argument(
+        "--call-delay",
+        type=int,
+        default=DEFAULT_CALL_DELAY,
+        help=f"Delay between API calls (default: {DEFAULT_CALL_DELAY})",
+    )
+    return parser.parse_args()
+
 
 # ── Labels ────────────────────────────────────────────────────────────────────
 
@@ -152,11 +220,8 @@ LENGTH_PROFILES = {
 }
 
 OMNIVOICE_CONTROL_TOKENS = [
-    "[pause]",
-    "[laugh]",
+    "[laughter]",
     "[sigh]",
-    "[cough]",
-    "[breath]",
 ]
 
 # ── News feeds ────────────────────────────────────────────────────────────────
@@ -457,7 +522,7 @@ Setiap object wajib punya field:
 """
 
 
-def call_api(prompt: str, label: str, batch_n: int) -> list[dict]:
+def call_api(prompt: str, label: str, batch_n: int, model: str) -> list[dict]:
     """
     BUG FIX: accepts batch_n so the schema minItems matches the actual
     requested batch size, not the global BATCH_SIZE constant.
@@ -471,7 +536,7 @@ def call_api(prompt: str, label: str, batch_n: int) -> list[dict]:
             "Content-Type": "application/json",
         },
         json={
-            "model": MODEL,
+            "model": model,
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
@@ -582,6 +647,11 @@ def generate_label(
     batch_size: int,
     headline_pool: list[str],
     all_items: list[dict],
+    context_per_batch: int,
+    max_retries: int,
+    retry_delay: int,
+    call_delay: int,
+    model: str,
 ) -> tuple[list[dict], list[list[str]]]:
     results: list[dict] = []
     batch_contexts_used: list[list[str]] = []
@@ -593,30 +663,30 @@ def generate_label(
         remaining -= batch_size
 
     for b_idx, b_size in enumerate(batches, 1):
-        batch_context = sample_context(headline_pool, CONTEXT_PER_BATCH)
+        batch_context = sample_context(headline_pool, context_per_batch)
         print(
             f"    batch {b_idx}/{len(batches)} ({b_size} items)...",
             end=" ",
             flush=True,
         )
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        for attempt in range(1, max_retries + 1):
             try:
                 prompt = build_prompt(label, definition, b_size, batch_context)
-                items = call_api(prompt, label, b_size)
+                items = call_api(prompt, label, b_size, model)
                 results.extend(items)
                 batch_contexts_used.append(batch_context)
                 print(
                     f"ok ({len(items)} items, total so far: {len(all_items) + len(results)})"
                 )
                 save_checkpoint(all_items + results, CHECKPOINT_FILE)
-                time.sleep(CALL_DELAY)
+                time.sleep(call_delay)
                 break
             except Exception as e:
-                print(f"fail [{attempt}/{MAX_RETRIES}]: {e}")
-                if attempt < MAX_RETRIES:
-                    print(f"    retrying in {RETRY_DELAY}s...")
-                    time.sleep(RETRY_DELAY)
+                print(f"fail [{attempt}/{max_retries}]: {e}")
+                if attempt < max_retries:
+                    print(f"    retrying in {retry_delay}s...")
+                    time.sleep(retry_delay)
                 else:
                     print(f"    [error] Skipping batch {b_idx} for '{label}'.")
 
@@ -684,32 +754,46 @@ def validate(results: list[dict], labels: dict, n: int) -> None:
 
 
 def main() -> None:
+    args = parse_args()
+
     if not OPENROUTER_API_KEY:
         raise SystemExit("OPENROUTER_API_KEY is not set.")
 
     print("=== TTS Script Generator ===\n")
-    print(f"  Model           : {MODEL}")
-    print(f"  N per label     : {N}")
-    print(f"  Batch size      : {BATCH_SIZE}")
-    print(f"  Context pool    : {CONTEXT_POOL_SIZE} headlines")
-    print(f"  Context/batch   : {CONTEXT_PER_BATCH} headlines per call")
+    print(f"  Model           : {args.model}")
+    print(f"  N per label     : {args.n}")
+    print(f"  Batch size      : {args.batch_size}")
+    print(f"  Context pool    : {args.context_pool_size} headlines")
+    print(f"  Context/batch   : {args.context_per_batch} headlines per call")
     print(f"  Labels          : {', '.join(LABELS.keys())}\n")
 
     start_time = time.time()
 
     print("Step 1: Building headline pool...")
     headline_pool = fetch_headline_pool(
-        ALL_NEWS_FEEDS, FEEDS_PER_RUN, CONTEXT_POOL_SIZE
+        ALL_NEWS_FEEDS, args.feeds_per_run, args.context_pool_size
     )
 
-    print(f"\nStep 2: Generating {N} x {len(LABELS)} = {N * len(LABELS)} items...\n")
+    print(
+        f"\nStep 2: Generating {args.n} x {len(LABELS)} = {args.n * len(LABELS)} items...\n"
+    )
     all_items: list[dict] = []
     all_batch_contexts: dict[str, list[list[str]]] = {}
 
     for label, definition in LABELS.items():
         print(f"  [{label}]")
         items, batch_ctxs = generate_label(
-            label, definition, N, BATCH_SIZE, headline_pool, all_items
+            label,
+            definition,
+            args.n,
+            args.batch_size,
+            headline_pool,
+            all_items,
+            args.context_per_batch,
+            args.max_retries,
+            args.retry_delay,
+            args.call_delay,
+            args.model,
         )
         all_items.extend(items)
         all_batch_contexts[label] = batch_ctxs
@@ -719,22 +803,32 @@ def main() -> None:
         print(f"\n[warn] Missing labels: {missing}. Re-running...")
         for label in missing:
             items, batch_ctxs = generate_label(
-                label, LABELS[label], N, BATCH_SIZE, headline_pool, all_items
+                label,
+                LABELS[label],
+                args.n,
+                args.batch_size,
+                headline_pool,
+                all_items,
+                args.context_per_batch,
+                args.max_retries,
+                args.retry_delay,
+                args.call_delay,
+                args.model,
             )
             all_items.extend(items)
             all_batch_contexts[label] = batch_ctxs
 
-    validate(all_items, LABELS, N)
+    validate(all_items, LABELS, args.n)
 
     output = {
         "metadata": {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "time_taken": f"{(time.time() - start_time) / 60:.1f} minutes",
-            "model": MODEL,
-            "n_per_label": N,
-            "batch_size": BATCH_SIZE,
-            "context_pool_size": CONTEXT_POOL_SIZE,
-            "context_per_batch": CONTEXT_PER_BATCH,
+            "model": args.model,
+            "n_per_label": args.n,
+            "batch_size": args.batch_size,
+            "context_pool_size": args.context_pool_size,
+            "context_per_batch": args.context_per_batch,
             "labels": list(LABELS.keys()),
             "headline_pool": headline_pool,
             "batch_contexts": all_batch_contexts,
@@ -742,13 +836,13 @@ def main() -> None:
         "items": all_items,
     }
 
-    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+    with open(args.output, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     if os.path.exists(CHECKPOINT_FILE):
         os.remove(CHECKPOINT_FILE)
 
-    print(f"\nSaved {len(all_items)} items to '{OUTPUT_FILE}'.")
+    print(f"\nSaved {len(all_items)} items to '{args.output}'.")
 
 
 if __name__ == "__main__":
